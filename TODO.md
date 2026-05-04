@@ -1,0 +1,21 @@
+# AmongUS Discord Bot - offene Annahmen fuer V1
+
+- Mindestspielerzahl: V1 erlaubt Start ab 3 Spielern, damit eine einfache Impostor/Crewmate-Verteilung sinnvoll ist.
+- Impostor-Anzahl: V1 nutzt 1 Impostor bis 7 Spieler, danach 2 Impostors.
+- Task-Mix: Default ist 3 short, 2 medium, 1 long pro Spieler; per `/amongus create` anpassbar.
+- Impostors erhalten Fake-Tasks aus denselben Task-Listen, damit sie nicht auffallen.
+- Es gibt pro Discord-Server nur eine aktive Session.
+- Tasks sind Vertrauenssache; der Bot prueft nur Klicks auf "Erledigt".
+- Leichenmeldung fragt den Fundort als Modal ab und startet direkt die Meeting-Phase.
+- Voting ist als einfache Button-Interaktion im Meeting-Kanal umgesetzt; bei Gleichstand fliegt niemand raus.
+- Spielende wird automatisch bei spezifizierten Siegbedingungen erkannt und kann zusaetzlich durch Admin beendet werden.
+- Temporaere Kanaele werden bei Session-Ende per Button bestaetigt geloescht.
+- Kill-Cooldown: V1 nutzt 30 Sekunden pro Impostor, konfigurierbar per `KILL_COOLDOWN_SECONDS`.
+- Nach einem Meeting wird der Kill-Cooldown fuer lebende Impostors neu gestartet.
+- Admin-beendete Spiele haben keinen Gewinner; die Zusammenfassung markiert den Gewinner als "nicht festgelegt".
+- Meeting-Zeiten werden in V1 angezeigt, aber noch nicht automatisch als Countdown/Timer ausgefuehrt.
+- Der Meeting-Kanal wird als temporaerer Meeting-only-Kanal behandelt; vor neuen Meetings loescht der Bot aktuelle Meeting-Kanal-Nachrichten bestmoeglich.
+- Emergency-User ist fuer V1 bei `/amongus create` verpflichtend und nimmt nicht als normaler Spieler teil.
+- Emergency-Cooldown nutzt pro Session den beim Erstellen gespeicherten Config-Wert `EMERGENCY_COOLDOWN_SECONDS`.
+- V1 nutzt eine feste `Among Us`-Kategorie mit festen Hauptkanaelen; nur private Spielerkanäle sind temporaer.
+- False-Report-Verwarnungen sind serverweit persistent; bei 2/2 wird der Spieler automatisch aus der laufenden Session entfernt.

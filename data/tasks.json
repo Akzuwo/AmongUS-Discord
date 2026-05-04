@@ -1,0 +1,20 @@
+{
+  "short_tasks": [
+    "Gehe zu einem bestimmten Ort.",
+    "Finde ein bestimmtes Objekt.",
+    "Zaehle etwas in deiner Umgebung.",
+    "Merke dir ein Codewort."
+  ],
+  "medium_tasks": [
+    "Loese ein kleines Raetsel.",
+    "Finde mehrere Stationen.",
+    "Hole eine Information von einem Ort.",
+    "Kombiniere zwei Hinweise."
+  ],
+  "long_tasks": [
+    "Loese eine mehrteilige Raetselaufgabe.",
+    "Suche mehrere Orte auf.",
+    "Erfuelle eine kleine Challenge.",
+    "Sammle mehrere Informationen."
+  ]
+}

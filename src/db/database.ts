@@ -1,0 +1,139 @@
+import path from "node:path";
+import fs from "node:fs";
+import sqlite3 from "sqlite3";
+import { open, Database } from "sqlite";
+import { config } from "../config";
+
+let db: Database<sqlite3.Database, sqlite3.Statement> | null = null;
+
+export async function getDb(): Promise<Database<sqlite3.Database, sqlite3.Statement>> {
+  if (db) {
+    return db;
+  }
+
+  fs.mkdirSync(path.dirname(config.databasePath), { recursive: true });
+  db = await open({
+    filename: config.databasePath,
+    driver: sqlite3.Database
+  });
+
+  await db.exec("PRAGMA foreign_keys = ON");
+  return db;
+}
+
+export async function initDb(): Promise<void> {
+  const database = await getDb();
+  await database.exec(`
+    CREATE TABLE IF NOT EXISTS sessions (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      guild_id TEXT NOT NULL,
+      status TEXT NOT NULL,
+      category_id TEXT,
+      lobby_channel_id TEXT,
+      meeting_channel_id TEXT,
+      admin_channel_id TEXT,
+      emergency_channel_id TEXT,
+      join_message_id TEXT,
+      created_by TEXT NOT NULL,
+      emergency_user_id TEXT NOT NULL DEFAULT '',
+      last_emergency_meeting_at INTEGER,
+      emergency_cooldown_seconds INTEGER NOT NULL DEFAULT 300,
+      short_tasks INTEGER NOT NULL,
+      medium_tasks INTEGER NOT NULL,
+      long_tasks INTEGER NOT NULL,
+      discussion_time_minutes INTEGER NOT NULL DEFAULT 3,
+      voting_time_minutes INTEGER NOT NULL DEFAULT 2,
+      created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      ended_at TEXT
+    );
+
+    CREATE TABLE IF NOT EXISTS players (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      session_id INTEGER NOT NULL,
+      user_id TEXT NOT NULL,
+      username TEXT NOT NULL,
+      role TEXT,
+      state TEXT NOT NULL DEFAULT 'alive',
+      death_reported INTEGER NOT NULL DEFAULT 0,
+      false_body_reports INTEGER NOT NULL DEFAULT 0,
+      channel_id TEXT,
+      joined_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      UNIQUE(session_id, user_id),
+      FOREIGN KEY(session_id) REFERENCES sessions(id) ON DELETE CASCADE
+    );
+
+    CREATE TABLE IF NOT EXISTS player_tasks (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      session_id INTEGER NOT NULL,
+      user_id TEXT NOT NULL,
+      task_type TEXT NOT NULL,
+      description TEXT NOT NULL,
+      completed INTEGER NOT NULL DEFAULT 0,
+      FOREIGN KEY(session_id) REFERENCES sessions(id) ON DELETE CASCADE
+    );
+
+    CREATE TABLE IF NOT EXISTS reports (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      session_id INTEGER NOT NULL,
+      reporter_id TEXT NOT NULL,
+      victim_id TEXT,
+      location TEXT NOT NULL,
+      created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      FOREIGN KEY(session_id) REFERENCES sessions(id) ON DELETE CASCADE
+    );
+
+    CREATE TABLE IF NOT EXISTS kills (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      session_id INTEGER NOT NULL,
+      killer_id TEXT NOT NULL,
+      victim_id TEXT NOT NULL,
+      created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      FOREIGN KEY(session_id) REFERENCES sessions(id) ON DELETE CASCADE
+    );
+
+    CREATE TABLE IF NOT EXISTS kill_cooldowns (
+      session_id INTEGER NOT NULL,
+      impostor_id TEXT NOT NULL,
+      next_kill_at INTEGER NOT NULL,
+      PRIMARY KEY(session_id, impostor_id),
+      FOREIGN KEY(session_id) REFERENCES sessions(id) ON DELETE CASCADE
+    );
+
+    CREATE TABLE IF NOT EXISTS votes (
+      session_id INTEGER NOT NULL,
+      voter_id TEXT NOT NULL,
+      target_user_id TEXT NOT NULL,
+      PRIMARY KEY(session_id, voter_id),
+      FOREIGN KEY(session_id) REFERENCES sessions(id) ON DELETE CASCADE
+    );
+
+    CREATE TABLE IF NOT EXISTS false_report_warnings (
+      guild_id TEXT NOT NULL,
+      user_id TEXT NOT NULL,
+      warnings INTEGER NOT NULL DEFAULT 0,
+      updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      PRIMARY KEY(guild_id, user_id)
+    );
+  `);
+  await ensureColumn(database, "reports", "victim_id", "TEXT");
+  await ensureColumn(database, "sessions", "discussion_time_minutes", "INTEGER NOT NULL DEFAULT 3");
+  await ensureColumn(database, "sessions", "voting_time_minutes", "INTEGER NOT NULL DEFAULT 2");
+  await ensureColumn(database, "sessions", "emergency_channel_id", "TEXT");
+  await ensureColumn(database, "sessions", "emergency_user_id", "TEXT NOT NULL DEFAULT ''");
+  await ensureColumn(database, "sessions", "last_emergency_meeting_at", "INTEGER");
+  await ensureColumn(database, "sessions", "emergency_cooldown_seconds", "INTEGER NOT NULL DEFAULT 300");
+  await ensureColumn(database, "players", "death_reported", "INTEGER NOT NULL DEFAULT 0");
+  await ensureColumn(database, "players", "false_body_reports", "INTEGER NOT NULL DEFAULT 0");
+}
+
+async function ensureColumn(
+  database: Database<sqlite3.Database, sqlite3.Statement>,
+  table: string,
+  column: string,
+  definition: string
+): Promise<void> {
+  const rows = await database.all(`PRAGMA table_info(${table})`);
+  if (!rows.some((row: any) => row.name === column)) {
+    await database.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`);
+  }
+}
