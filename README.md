@@ -54,7 +54,7 @@ EXTRA_CA_CERT_PATH=
 WEB_PANEL_ENABLED=true
 WEB_PANEL_PORT=3000
 ADMIN_PANEL_ENABLED=false
-ADMIN_PANEL_KEY=
+ADMIN_PANEL_PORT=3001
 ```
 
 ## Bedeutung der Einstellungen
@@ -141,17 +141,18 @@ Optionales Adminpanel:
 
 ```env
 ADMIN_PANEL_ENABLED=true
-ADMIN_PANEL_KEY=
+ADMIN_PANEL_PORT=3001
 ```
 
 Routen:
 
 ```text
-http://localhost:3000/admin
-http://localhost:3000/panel/admin
+http://localhost:3001/
+http://localhost:3001/admin
+http://localhost:3001/panel/admin
 ```
 
-Wenn `ADMIN_PANEL_ENABLED=false` gesetzt ist, bleibt das Adminpanel deaktiviert.
+Wenn `ADMIN_PANEL_ENABLED=false` gesetzt ist, bleibt das Adminpanel deaktiviert. Das Adminpanel braucht keinen Key mehr und laeuft stattdessen auf einem getrennten lokalen Port.
 
 ## Bot starten
 

@@ -1,4 +1,4 @@
-import express, { Request, Response } from "express";
+import express, { Response } from "express";
 import { Client, Guild } from "discord.js";
 import { config } from "./config";
 import { getLatestActiveSession } from "./db/repository";
@@ -21,28 +21,21 @@ export function startWebPanel(client: Client): void {
     return;
   }
 
-  if (config.adminPanelEnabled && !config.adminPanelKey) {
-    panelLogger.warn("Adminpanel ist aktiv, aber kein ADMIN_PANEL_KEY gesetzt.");
-  }
-
-  const app = express();
-  app.use(express.json());
-  app.use((request, _response, next) => {
-    panelLogger.debug("API request.", { method: request.method, path: request.path });
+  const publicApp = express();
+  publicApp.use(express.json());
+  publicApp.use((request, _response, next) => {
+    panelLogger.debug("Public request.", { method: request.method, path: request.path });
     next();
   });
 
-  app.get("/", (_request, response) => response.type("html").send(publicPanelHtml()));
-  app.get("/panel", (_request, response) => response.type("html").send(publicPanelHtml()));
+  publicApp.get("/", (_request, response) => response.type("html").send(publicPanelHtml()));
+  publicApp.get("/panel", (_request, response) => response.type("html").send(publicPanelHtml()));
 
-  app.get("/admin", (request, response) => handleAdminPage(request, response));
-  app.get("/panel/admin", (request, response) => handleAdminPage(request, response));
-
-  app.get("/api/session/status", async (_request, response) => {
+  publicApp.get("/api/session/status", async (_request, response) => {
     await respond(response, async () => getPublicWebPanelStatus());
   });
 
-  app.post("/api/emergency/start", async (_request, response) => {
+  publicApp.post("/api/emergency/start", async (_request, response) => {
     await respond(response, async () => {
       const guild = await activeGuild(client);
       await startEmergencyMeetingFromWeb(guild);
@@ -50,7 +43,7 @@ export function startWebPanel(client: Client): void {
     });
   });
 
-  app.post("/api/meeting/start-discussion", async (_request, response) => {
+  publicApp.post("/api/meeting/start-discussion", async (_request, response) => {
     await respond(response, async () => {
       const guild = await activeGuild(client);
       await startMeetingDiscussion(guild);
@@ -58,7 +51,7 @@ export function startWebPanel(client: Client): void {
     });
   });
 
-  app.post("/api/meeting/start-voting", async (_request, response) => {
+  publicApp.post("/api/meeting/start-voting", async (_request, response) => {
     await respond(response, async () => {
       const guild = await activeGuild(client);
       await startMeetingVoting(guild);
@@ -66,7 +59,7 @@ export function startWebPanel(client: Client): void {
     });
   });
 
-  app.post("/api/meeting/evaluate-voting", async (_request, response) => {
+  publicApp.post("/api/meeting/evaluate-voting", async (_request, response) => {
     await respond(response, async () => {
       const session = await getLatestActiveSession();
       if (!session) {
@@ -78,17 +71,30 @@ export function startWebPanel(client: Client): void {
     });
   });
 
-  app.get("/api/admin/status", async (request, response) => {
-    if (!ensureAdminApiAccess(request, response)) {
-      return;
-    }
+  publicApp.listen(config.webPanelPort, "127.0.0.1", () => {
+    panelLogger.info(`Webpanel läuft auf http://localhost:${config.webPanelPort}`);
+  });
+
+  if (!config.adminPanelEnabled) {
+    return;
+  }
+
+  const adminApp = express();
+  adminApp.use(express.json());
+  adminApp.use((request, _response, next) => {
+    panelLogger.debug("Admin request.", { method: request.method, path: request.path });
+    next();
+  });
+
+  adminApp.get("/", (_request, response) => response.type("html").send(adminPanelHtml()));
+  adminApp.get("/admin", (_request, response) => response.type("html").send(adminPanelHtml()));
+  adminApp.get("/panel/admin", (_request, response) => response.type("html").send(adminPanelHtml()));
+
+  adminApp.get("/api/admin/status", async (_request, response) => {
     await respond(response, async () => getAdminPanelStatus());
   });
 
-  app.post("/api/admin/meeting/start-discussion", async (request, response) => {
-    if (!ensureAdminApiAccess(request, response)) {
-      return;
-    }
+  adminApp.post("/api/admin/meeting/start-discussion", async (_request, response) => {
     await respond(response, async () => {
       const guild = await activeGuild(client);
       await startMeetingDiscussion(guild);
@@ -96,10 +102,7 @@ export function startWebPanel(client: Client): void {
     });
   });
 
-  app.post("/api/admin/meeting/start-voting", async (request, response) => {
-    if (!ensureAdminApiAccess(request, response)) {
-      return;
-    }
+  adminApp.post("/api/admin/meeting/start-voting", async (_request, response) => {
     await respond(response, async () => {
       const guild = await activeGuild(client);
       await startMeetingVoting(guild);
@@ -107,10 +110,7 @@ export function startWebPanel(client: Client): void {
     });
   });
 
-  app.post("/api/admin/meeting/evaluate-voting", async (request, response) => {
-    if (!ensureAdminApiAccess(request, response)) {
-      return;
-    }
+  adminApp.post("/api/admin/meeting/evaluate-voting", async (_request, response) => {
     await respond(response, async () => {
       const session = await getLatestActiveSession();
       if (!session) {
@@ -122,10 +122,7 @@ export function startWebPanel(client: Client): void {
     });
   });
 
-  app.post("/api/admin/player/kick", async (request, response) => {
-    if (!ensureAdminApiAccess(request, response)) {
-      return;
-    }
+  adminApp.post("/api/admin/player/kick", async (request, response) => {
     await respond(response, async () => {
       const guild = await activeGuild(client);
       const playerId = String(request.body?.player_id || "");
@@ -137,10 +134,7 @@ export function startWebPanel(client: Client): void {
     });
   });
 
-  app.post("/api/admin/session/end", async (request, response) => {
-    if (!ensureAdminApiAccess(request, response)) {
-      return;
-    }
+  adminApp.post("/api/admin/session/end", async (_request, response) => {
     await respond(response, async () => {
       const session = await getLatestActiveSession();
       if (!session) {
@@ -152,33 +146,9 @@ export function startWebPanel(client: Client): void {
     });
   });
 
-  app.listen(config.webPanelPort, "127.0.0.1", () => {
-    panelLogger.info(`Webpanel läuft auf http://localhost:${config.webPanelPort}`);
+  adminApp.listen(config.adminPanelPort, "127.0.0.1", () => {
+    panelLogger.info(`Adminpanel läuft auf http://localhost:${config.adminPanelPort}`);
   });
-}
-
-function handleAdminPage(_request: Request, response: Response): void {
-  if (!config.adminPanelEnabled) {
-    response.status(404).type("html").send(messagePageHtml("Adminpanel ist deaktiviert."));
-    return;
-  }
-  response.type("html").send(adminPanelHtml());
-}
-
-function ensureAdminApiAccess(request: Request, response: Response): boolean {
-  if (!config.adminPanelEnabled) {
-    response.status(403).json({ ok: false, error: "Adminpanel ist deaktiviert." });
-    return false;
-  }
-  if (!config.adminPanelKey) {
-    return true;
-  }
-  const provided = String(request.header("x-admin-key") || request.query.key || request.body?.key || "");
-  if (provided !== config.adminPanelKey) {
-    response.status(403).json({ ok: false, error: "Ungueltiger Admin-Key." });
-    return false;
-  }
-  return true;
 }
 
 async function respond(response: Response, action: () => Promise<object>): Promise<void> {
@@ -231,7 +201,6 @@ function shellHtml(title: string, body: string): string {
     .pill { display: inline-block; border: 1px solid var(--line); border-radius: 999px; padding: 6px 10px; font-size: 13px; color: var(--muted); }
     table { width: 100%; border-collapse: collapse; }
     th, td { padding: 8px; text-align: left; border-bottom: 1px solid #ebe3da; vertical-align: top; }
-    input { padding: 9px; border: 1px solid var(--line); border-radius: 6px; min-width: 280px; }
     @media (max-width: 640px) { h1 { font-size: 28px; } main { padding: 16px 12px 28px; } }
   </style>
 </head>
@@ -241,10 +210,6 @@ ${body}
 </main>
 </body>
 </html>`;
-}
-
-function messagePageHtml(message: string): string {
-  return shellHtml("AmongUS Adminpanel", `<section><h1>AmongUS Adminpanel</h1><p>${message}</p></section>`);
 }
 
 function publicPanelHtml(): string {
@@ -290,11 +255,7 @@ function publicPanelHtml(): string {
   bind("startDiscussion", () => post("/api/meeting/start-discussion"));
   bind("startVoting", () => post("/api/meeting/start-voting"));
   bind("evaluateVoting", () => post("/api/meeting/evaluate-voting"));
-
-  function bind(id, fn) {
-    const element = document.getElementById(id);
-    if (element) element.onclick = fn;
-  }
+  function bind(id, fn) { const element = document.getElementById(id); if (element) element.onclick = fn; }
   async function post(url) {
     const response = await fetch(url, { method: "POST", headers: { "content-type": "application/json" }, body: "{}" });
     const data = await response.json();
@@ -311,32 +272,16 @@ function publicPanelHtml(): string {
     toggle("taskBox", hasSession);
     toggle("emergencyBox", hasSession && data.active && isRunning(data.session));
     toggle("meetingBox", hasSession && data.active && data.session.status === "meeting");
-
-    if (!hasSession) {
-      show(data.message || "Aktuell läuft keine Session.", true);
-      return;
-    }
-
+    if (!hasSession) { show(data.message || "Aktuell läuft keine Session.", true); return; }
     setText("tasks", data.taskProgress.done + "/" + data.taskProgress.total + " (" + data.taskProgress.percent + "%)");
-
-    if (!data.active) {
-      show("Session beendet.", true);
-      toggle("emergencyBox", false);
-      toggle("meetingBox", false);
-      return;
-    }
-
+    if (!data.active) { show("Session beendet.", true); toggle("emergencyBox", false); toggle("meetingBox", false); return; }
     if (isRunning(data.session)) {
       setText("emergencyStatus", data.emergency.cooldownReady ? "Status: bereit" : "Cooldown: " + formatDuration(data.emergency.cooldownRemainingSeconds));
       setDisabled("startEmergency", false);
       show("Session läuft.", true);
       return;
     }
-
-    if (data.session.status === "meeting") {
-      renderMeeting(data);
-      return;
-    }
+    if (data.session.status === "meeting") { renderMeeting(data); }
   }
   function renderMeeting(data) {
     const phase = data.session.meetingPhase;
@@ -366,13 +311,8 @@ function publicPanelHtml(): string {
       show("Voting läuft", true);
       return;
     }
-    setText("meetingTitle", "Meeting");
-    setText("meetingText", "Meetingstatus wird aktualisiert.");
-    setText("meetingTime", "");
   }
-  function isRunning(session) {
-    return session.status === "playing" || session.status === "running";
-  }
+  function isRunning(session) { return session.status === "playing" || session.status === "running"; }
   function remaining(startedAt, minutes) {
     if (!startedAt) return "-";
     const left = Math.max(0, Math.round((startedAt + minutes * 60000 - Date.now()) / 1000));
@@ -399,11 +339,7 @@ function adminPanelHtml(): string {
   <section>
     <h1>AmongUS Adminpanel</h1>
     <p class="muted">Optionales Kontrollpanel fuer Admin-, Debug- und Session-Aktionen.</p>
-    <div class="row">
-      <input id="key" type="password" placeholder="ADMIN_PANEL_KEY">
-      <button id="saveKey" class="secondary">Key speichern</button>
-      <button id="refresh">Status aktualisieren</button>
-    </div>
+    <button id="refresh">Status aktualisieren</button>
   </section>
 
   <section>
@@ -441,30 +377,20 @@ function adminPanelHtml(): string {
 
   <script>
   let currentStatus = null;
-  const keyInput = document.getElementById("key");
-  keyInput.value = localStorage.getItem("amongus_admin_key") || new URLSearchParams(location.search).get("key") || "";
-  document.getElementById("saveKey").onclick = () => {
-    localStorage.setItem("amongus_admin_key", keyInput.value);
-    show("Key gespeichert.", true);
-  };
   document.getElementById("refresh").onclick = loadStatus;
   bind("startDiscussion", () => post("/api/admin/meeting/start-discussion"));
   bind("startVoting", () => post("/api/admin/meeting/start-voting"));
   bind("evaluateVoting", () => post("/api/admin/meeting/evaluate-voting"));
   bind("endSession", () => post("/api/admin/session/end"));
-
-  function bind(id, fn) {
-    const element = document.getElementById(id);
-    if (element) element.onclick = fn;
-  }
+  function bind(id, fn) { const element = document.getElementById(id); if (element) element.onclick = fn; }
   async function post(url, body = {}) {
-    const response = await fetch(url, { method: "POST", headers: { "content-type": "application/json", "x-admin-key": keyInput.value }, body: JSON.stringify(body) });
+    const response = await fetch(url, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
     const data = await response.json();
     show(data.error || data.message || "OK", !data.error);
     await loadStatus();
   }
   async function loadStatus() {
-    const response = await fetch("/api/admin/status", { headers: { "x-admin-key": keyInput.value } });
+    const response = await fetch("/api/admin/status");
     const data = await response.json();
     currentStatus = data;
     render(data);

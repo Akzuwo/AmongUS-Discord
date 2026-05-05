@@ -25,6 +25,6 @@ export const config = {
   webPanelEnabled: (process.env.WEB_PANEL_ENABLED || "true").toLowerCase() !== "false",
   webPanelPort: Number(process.env.WEB_PANEL_PORT || "3000"),
   adminPanelEnabled: (process.env.ADMIN_PANEL_ENABLED || "false").toLowerCase() === "true",
-  adminPanelKey: process.env.ADMIN_PANEL_KEY || "",
+  adminPanelPort: Number(process.env.ADMIN_PANEL_PORT || "3001"),
   emergencyPanelKey: process.env.EMERGENCY_PANEL_KEY || ""
 };

@@ -1,8 +1,0 @@
-
-> amongus-discord@0.1.0 dev
-> node start-dev.js
-
-Using extra CA certificate: C:\Users\timow\Desktop\Projekte\sluz_cert\schule.pem
-[INFO][App] Botstart initialisiert. { debugMode: false, webPanelEnabled: true }
-[INFO][WebPanel] Webpanel läuft auf http://localhost:3000
-[INFO][App] AmongUS Bot gestartet als MongusBot#4770
