@@ -8,8 +8,28 @@ export const amongUsCommand = new SlashCommandBuilder()
     subcommand
       .setName("create")
       .setDescription("Neue Session erstellen")
-      .addUserOption((option) =>
-        option.setName("emergency_user").setDescription("User, der Emergency Meetings ausloesen darf").setRequired(true)
+      .addIntegerOption((option) =>
+        option.setName("short").setDescription("Short Tasks pro Spieler").setMinValue(0).setMaxValue(10)
+      )
+      .addIntegerOption((option) =>
+        option.setName("medium").setDescription("Medium Tasks pro Spieler").setMinValue(0).setMaxValue(10)
+      )
+      .addIntegerOption((option) =>
+        option.setName("long").setDescription("Long Tasks pro Spieler").setMinValue(0).setMaxValue(10)
+      )
+      .addIntegerOption((option) =>
+        option.setName("discussion_time").setDescription("Diskussionszeit in Minuten").setMinValue(1).setMaxValue(15)
+      )
+      .addIntegerOption((option) =>
+        option.setName("voting_time").setDescription("Votingzeit in Minuten").setMinValue(1).setMaxValue(15)
+      )
+  )
+  .addSubcommand((subcommand) =>
+    subcommand
+      .setName("debug-create")
+      .setDescription("Debug-Runde mit Ghost-Spielern erstellen")
+      .addIntegerOption((option) =>
+        option.setName("ghost_count").setDescription("Anzahl Ghost-Spieler").setRequired(true).setMinValue(1).setMaxValue(config.debugMaxGhostPlayers)
       )
       .addIntegerOption((option) =>
         option.setName("short").setDescription("Short Tasks pro Spieler").setMinValue(0).setMaxValue(10)
@@ -29,6 +49,26 @@ export const amongUsCommand = new SlashCommandBuilder()
   )
   .addSubcommand((subcommand) => subcommand.setName("start").setDescription("Aktuelle Session starten"))
   .addSubcommand((subcommand) => subcommand.setName("meeting").setDescription("Admin-Meeting starten"))
+  .addSubcommand((subcommand) => subcommand.setName("debug-list").setDescription("Ghost-Spieler der Debug-Runde anzeigen"))
+  .addSubcommand((subcommand) =>
+    subcommand
+      .setName("debug-complete-task")
+      .setDescription("Naechsten offenen Ghost-Task oder Step abschliessen")
+      .addStringOption((option) => option.setName("player").setDescription("Ghost-Name oder ID").setRequired(true))
+  )
+  .addSubcommand((subcommand) =>
+    subcommand
+      .setName("debug-kill")
+      .setDescription("Ghost-Spieler als tot markieren")
+      .addStringOption((option) => option.setName("victim").setDescription("Ghost-Name oder ID").setRequired(true))
+  )
+  .addSubcommand((subcommand) =>
+    subcommand
+      .setName("debug-vote")
+      .setDescription("Ghost-Stimme abgeben")
+      .addStringOption((option) => option.setName("voter").setDescription("Ghost-Name oder ID").setRequired(true))
+      .addStringOption((option) => option.setName("target").setDescription("Spielername, Spieler-ID oder skip").setRequired(true))
+  )
   .addSubcommand((subcommand) =>
     subcommand
       .setName("clear-warns")

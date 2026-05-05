@@ -8,6 +8,7 @@ export const ids = {
   deleteConfirm: (sessionId: number) => `amongus:delete-confirm:${sessionId}`,
   deleteCancel: (sessionId: number) => `amongus:delete-cancel:${sessionId}`,
   taskDone: (taskId: number) => `amongus:task-done:${taskId}`,
+  taskStepDone: (sessionId: number, taskId: number, stepRowId: number) => `amongus:task-step:${sessionId}:${taskId}:${stepRowId}`,
   killPlayer: (sessionId: number) => `amongus:kill:${sessionId}`,
   killSelect: (sessionId: number) => `amongus:kill-select:${sessionId}`,
   emergencyMeeting: (sessionId: number) => `amongus:emergency:${sessionId}`,

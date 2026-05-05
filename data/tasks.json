@@ -1,18 +1,63 @@
 {
   "short_tasks": [
-    "Gehe zu einem bestimmten Ort.",
-    "Finde ein bestimmtes Objekt.",
+    {
+      "id": "short_001",
+      "title": "Sicherungskasten pruefen",
+      "description": "Gehe zum Sicherungskasten und pruefe ihn.",
+      "location": "Gang"
+    },
+    {
+      "id": "short_002",
+      "title": "Objekt finden",
+      "description": "Finde ein bestimmtes Objekt in deiner Umgebung."
+    },
     "Zaehle etwas in deiner Umgebung.",
     "Merke dir ein Codewort."
   ],
   "medium_tasks": [
     "Loese ein kleines Raetsel.",
-    "Finde mehrere Stationen.",
+    {
+      "id": "medium_001",
+      "title": "Stationen ablaufen",
+      "description": "Finde mehrere Stationen und bestaetige sie nacheinander.",
+      "steps": [
+        {
+          "id": "station_a",
+          "title": "Station A finden"
+        },
+        {
+          "id": "station_b",
+          "title": "Station B finden"
+        }
+      ]
+    },
     "Hole eine Information von einem Ort.",
     "Kombiniere zwei Hinweise."
   ],
   "long_tasks": [
-    "Loese eine mehrteilige Raetselaufgabe.",
+    {
+      "id": "long_001",
+      "title": "Reaktor kalibrieren",
+      "description": "Fuehre alle Kalibrierungsschritte aus.",
+      "location": "Technikraum",
+      "steps": [
+        {
+          "id": "step_1",
+          "title": "Schalter A aktivieren",
+          "description": "Gehe zu Station A und aktiviere den Schalter."
+        },
+        {
+          "id": "step_2",
+          "title": "Code bei Station B ablesen",
+          "description": "Gehe zu Station B und lies den Code ab."
+        },
+        {
+          "id": "step_3",
+          "title": "Code bei Station C eingeben",
+          "description": "Gehe zu Station C und gib den Code ein."
+        }
+      ]
+    },
     "Suche mehrere Orte auf.",
     "Erfuelle eine kleine Challenge.",
     "Sammle mehrere Informationen."

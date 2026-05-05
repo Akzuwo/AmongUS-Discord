@@ -18,7 +18,7 @@ export async function handleModal(interaction: ModalSubmitInteraction): Promise<
     await interaction.deferReply({ flags: MessageFlags.Ephemeral });
     const location = interaction.fields.getTextInputValue("location");
     await reportBody(interaction.guild, Number(parts[2]), interaction.user.id, location);
-    await interaction.editReply("Leiche gemeldet. Meeting wurde gestartet.");
+    await interaction.editReply("Leiche gemeldet. Meeting wurde ausgeloest.");
   } catch (error) {
     const message = error instanceof Error ? error.message : "Unbekannter Fehler.";
     await safeReply(interaction, message);

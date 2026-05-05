@@ -15,7 +15,9 @@
 - Admin-beendete Spiele haben keinen Gewinner; die Zusammenfassung markiert den Gewinner als "nicht festgelegt".
 - Meeting-Zeiten werden in V1 angezeigt, aber noch nicht automatisch als Countdown/Timer ausgefuehrt.
 - Der Meeting-Kanal wird als temporaerer Meeting-only-Kanal behandelt; vor neuen Meetings loescht der Bot aktuelle Meeting-Kanal-Nachrichten bestmoeglich.
-- Emergency-User ist fuer V1 bei `/amongus create` verpflichtend und nimmt nicht als normaler Spieler teil.
+- Emergency Meetings werden in V1 ueber das lokale Webpanel ausgeloest; `/amongus create` benoetigt keinen Emergency-User.
 - Emergency-Cooldown nutzt pro Session den beim Erstellen gespeicherten Config-Wert `EMERGENCY_COOLDOWN_SECONDS`.
 - V1 nutzt eine feste `Among Us`-Kategorie mit festen Hauptkanaelen; nur private Spielerkanäle sind temporaer.
 - False-Report-Verwarnungen sind serverweit persistent; bei 2/2 wird der Spieler automatisch aus der laufenden Session entfernt.
+- Debug-Runden koennen Ghost-Spieler enthalten; diese bekommen keine privaten Discord-Kanaele, zaehlen aber bei Rollen, Voting und Siegbedingungen mit.
+- `DEBUG_MODE=true` aktiviert zusaetzliche Debug-Logs ohne Secrets oder Tokens auszugeben.

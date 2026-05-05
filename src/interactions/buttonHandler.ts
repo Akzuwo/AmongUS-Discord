@@ -6,6 +6,7 @@ import {
   canOpenBodyReportModal,
   castVote,
   completeTask,
+  completeTaskStep,
   deleteSessionChannels,
   endSession,
   joinSession,
@@ -14,7 +15,8 @@ import {
   reportBodyModal,
   sendAdminStatus,
   startEmergencyMeeting,
-  startGame
+  startGame,
+  taskMessageOptions
 } from "../services/gameService";
 import { ids } from "../utils/customIds";
 import { parseCustomId } from "../utils/customIds";
@@ -109,6 +111,14 @@ export async function handleButton(interaction: ButtonInteraction): Promise<void
       await completeTask(interaction.guild, Number(parts[2]), interaction.user.id);
       await interaction.message.edit({ components: [] });
       await interaction.followUp({ content: "Task als erledigt markiert.", flags: MessageFlags.Ephemeral });
+      return;
+    }
+
+    if (action === "task-step") {
+      await interaction.deferUpdate();
+      const result = await completeTaskStep(interaction.guild, Number(parts[2]), Number(parts[3]), Number(parts[4]), interaction.user.id);
+      await interaction.message.edit(taskMessageOptions(result.task, true));
+      await interaction.followUp({ content: result.message, flags: MessageFlags.Ephemeral });
       return;
     }
 

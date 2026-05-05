@@ -7,26 +7,34 @@ import { handleModal } from "./interactions/modalHandler";
 import { handleSelect } from "./interactions/selectHandler";
 import { registerCommands } from "./services/commandRegistry";
 import { isExpectedInteractionError, safeReply } from "./utils/interactionResponses";
+import { logger } from "./utils/logger";
+import { startWebPanel } from "./webPanel";
+
+const appLogger = logger.scoped("App");
 
 async function main(): Promise<void> {
+  appLogger.info("Botstart initialisiert.", { debugMode: config.debugMode, webPanelEnabled: config.webPanelEnabled });
   await initDb();
-  await registerCommands();
 
   const client = new Client({
     intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMembers]
   });
 
+  startWebPanel(client);
+  await registerCommands();
+
   client.once(Events.ClientReady, (readyClient) => {
-    console.log(`AmongUS Bot gestartet als ${readyClient.user.tag}`);
+    appLogger.info(`AmongUS Bot gestartet als ${readyClient.user.tag}`);
   });
 
   client.on(Events.Error, (error) => {
-    console.error("Discord client error", error);
+    appLogger.error("Discord client error.", error);
   });
 
   client.on(Events.InteractionCreate, async (interaction) => {
     try {
       if (interaction.isChatInputCommand() && interaction.commandName === "amongus") {
+        appLogger.debug("Slash Command ausgefuehrt.", { subcommand: interaction.options.getSubcommand(), userId: interaction.user.id });
         await handleAmongUsCommand(interaction);
         return;
       }
@@ -46,7 +54,7 @@ async function main(): Promise<void> {
       }
     } catch (error) {
       if (!isExpectedInteractionError(error)) {
-        console.error("Unhandled interaction error", error);
+        appLogger.warn("Unhandled interaction error.", error instanceof Error ? error.message : error);
       }
       if (interaction.isRepliable()) {
         await safeReply(interaction, "Es ist ein Fehler aufgetreten. Bitte versuche es erneut oder informiere die Spielleitung.");
@@ -58,14 +66,14 @@ async function main(): Promise<void> {
 }
 
 main().catch((error) => {
-  console.error(error);
+  appLogger.error("Botstart fehlgeschlagen.", error);
   process.exit(1);
 });
 
 process.on("unhandledRejection", (reason) => {
-  console.error("Unhandled promise rejection", reason);
+  appLogger.error("Unhandled promise rejection.", reason);
 });
 
 process.on("uncaughtException", (error) => {
-  console.error("Uncaught exception", error);
+  appLogger.error("Uncaught exception.", error);
 });

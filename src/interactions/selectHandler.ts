@@ -22,7 +22,7 @@ export async function handleSelect(interaction: StringSelectMenuInteraction): Pr
     if (action === "kill-select") {
       await interaction.deferReply({ flags: MessageFlags.Ephemeral });
       await reportKill(interaction.guild, sessionId, interaction.user.id, selectedUserId);
-      await interaction.editReply(`Kill wurde gemeldet: <@${selectedUserId}> ist tot.`);
+      await interaction.editReply("Kill wurde gemeldet.");
       return;
     }
 

@@ -1,4 +1,7 @@
 import { DiscordAPIError, InteractionReplyOptions, MessageFlags, RepliableInteraction } from "discord.js";
+import { logger } from "./logger";
+
+const interactionLogger = logger.scoped("Interaction");
 
 export function ephemeral(content: string): InteractionReplyOptions {
   return { content, flags: MessageFlags.Ephemeral };
@@ -31,7 +34,7 @@ export async function safeReply(
       logExpectedInteractionError(error);
       return;
     }
-    console.error("Failed to respond to interaction", error);
+    interactionLogger.error("Failed to respond to interaction.", error);
   }
 }
 
@@ -44,10 +47,10 @@ export function logExpectedInteractionError(error: unknown): void {
     return;
   }
   if (error.code === 10062) {
-    console.debug("Interaction expired before response could be sent.");
+    interactionLogger.debug("Interaction expired before response could be sent.");
     return;
   }
   if (error.code === 40060) {
-    console.debug("Interaction was already acknowledged.");
+    interactionLogger.debug("Interaction was already acknowledged.");
   }
 }

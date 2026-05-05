@@ -26,6 +26,8 @@ import {
   clearVotes,
   createSession,
   getActiveSession,
+  getLatestActiveSession,
+  getLatestSession,
   getKillCooldown,
   getKills,
   getFalseReportWarningsForGuild,
@@ -34,12 +36,16 @@ import {
   getReports,
   getSessionById,
   getTaskById,
+  getTaskStepById,
   getTasks,
   getUnreportedDeadPlayers,
   getVotes,
   incrementFalseReportWarning,
   markTaskDone,
+  markTaskDoneIfAllStepsDone,
   markDeathsReported,
+  markTaskStepDone,
+  setMeetingPhase,
   setKillCooldown,
   setLastEmergencyMeetingAt,
   setPlayerChannel,
@@ -50,22 +56,22 @@ import {
   updateSessionChannels
 } from "../db/repository";
 import { ids } from "../utils/customIds";
-import { playerDisplay, progressLine } from "../utils/format";
+import { playerDisplay, playerLabel, progressLine } from "../utils/format";
+import { logger } from "../utils/logger";
 import { loadTaskCatalog, pickTasks } from "./taskService";
 
 type Winner = "Crewmates" | "Impostors" | "nicht festgelegt";
+const gameLogger = logger.scoped("GameService");
 
 export async function createGameSession(
   guild: Guild,
   creator: GuildMember,
   counts = { short: 3, medium: 2, long: 1 },
   meetingTimes = { discussion: config.defaultDiscussionTimeMinutes, voting: config.defaultVotingTimeMinutes },
-  emergencyUserId = ""
+  emergencyUserId = "",
+  options: { isDebugSession?: boolean; ghostCount?: number } = {}
 ): Promise<GameSession> {
   validateMeetingTimes(meetingTimes);
-  if (!emergencyUserId) {
-    throw new Error("Bitte gib einen Emergency-User an.");
-  }
   const active = await getActiveSession(guild.id);
   if (active) {
     throw new Error(`Es gibt bereits eine aktive Session: ${active.id}`);
@@ -75,20 +81,22 @@ export async function createGameSession(
   const signup = await getOrCreateSignupChannel(guild, category.id, "amongus-anmeldung", creator.id);
   const meeting = await getOrCreateTextChannel(guild, category.id, "amongus-meeting");
   const admin = await getOrCreateAdminChannel(guild, category.id, "amongus-admin", creator.id);
-  const emergency = await getOrCreateEmergencyChannel(guild, category.id, "amongus-emergency", emergencyUserId, creator.id);
 
   await Promise.all([
     clearBotMessages(signup),
     clearMeetingChannel(meeting),
     clearBotMessages(admin),
-    clearBotMessages(emergency),
     clearStalePrivatePlayerChannels(guild, category.id)
   ]);
 
-  const session = await createSession(guild.id, creator.id, emergencyUserId, counts, meetingTimes);
+  const session = await createSession(guild.id, creator.id, emergencyUserId || null, counts, meetingTimes, options);
+
+  if ((options.ghostCount ?? 0) > 0) {
+    await createGhostPlayers(session.id, options.ghostCount ?? 0);
+  }
 
   const joinMessage = await signup.send({
-    embeds: [lobbyEmbed(session, [])],
+    embeds: [lobbyEmbed((await getSessionById(session.id)) as GameSession, await getPlayers(session.id))],
     components: [new ActionRowBuilder<ButtonBuilder>().addComponents(joinButton(session), startButton(session))]
   });
 
@@ -97,18 +105,32 @@ export async function createGameSession(
     lobbyChannelId: signup.id,
     meetingChannelId: meeting.id,
     adminChannelId: admin.id,
-    emergencyChannelId: emergency.id,
     joinMessageId: joinMessage.id
   });
 
   const created = (await getSessionById(session.id)) as GameSession;
-  await sendEmergencyPanel(emergency, created);
+  gameLogger.info(options.isDebugSession ? "Debug-Runde erstellt." : "Session erstellt.", {
+    sessionId: created.id,
+    guildId: created.guildId,
+    ghostCount: created.ghostCount
+  });
   await admin.send(
-    `Session ${session.id} erstellt. Task-Mix: ${counts.short} short, ${counts.medium} medium, ${counts.long} long. Meeting: ${meetingTimes.discussion} Min Diskussion, ${meetingTimes.voting} Min Voting.`
+    `${created.isDebugSession ? "Debug-Session" : "Session"} ${session.id} erstellt. Task-Mix: ${counts.short} short, ${counts.medium} medium, ${counts.long} long. Meeting: ${meetingTimes.discussion} Min Diskussion, ${meetingTimes.voting} Min Voting.${created.isDebugSession ? ` Ghost-Spieler: ${created.ghostCount}.` : ""}`
   );
   await sendAdminControls(admin, created);
   await sendAdminStatus(guild, session.id);
   return created;
+}
+
+export async function createDebugGameSession(
+  guild: Guild,
+  creator: GuildMember,
+  ghostCount: number,
+  counts = { short: 3, medium: 2, long: 1 },
+  meetingTimes = { discussion: config.defaultDiscussionTimeMinutes, voting: config.defaultVotingTimeMinutes }
+): Promise<GameSession> {
+  validateGhostCount(ghostCount);
+  return createGameSession(guild, creator, counts, meetingTimes, "", { isDebugSession: true, ghostCount });
 }
 
 export async function joinSession(guild: Guild, sessionId: number, member: GuildMember): Promise<void> {
@@ -116,11 +138,9 @@ export async function joinSession(guild: Guild, sessionId: number, member: Guild
   if (session.guildId !== guild.id || session.status !== "lobby") {
     throw new Error("Dieser Session kann nicht mehr beigetreten werden.");
   }
-  if (member.id === session.emergencyUserId) {
-    throw new Error("Du bist fuer diese Session als Emergency-User festgelegt und nimmst nicht als normaler Spieler teil.");
-  }
 
-  await addPlayer(session.id, member.id, member.displayName);
+  await addPlayer(session.id, member.id, member.displayName, { discordUserId: member.id, isGhost: false });
+  gameLogger.debug("Spieler tritt bei.", { sessionId: session.id, userId: member.id, username: member.displayName });
   await refreshLobby(guild, session.id);
   await sendAdminStatus(guild, session.id);
 }
@@ -136,6 +156,7 @@ export async function startGame(guild: Guild, sessionId: number): Promise<void> 
     throw new Error("Mindestens 3 Spieler werden fuer V1 benoetigt.");
   }
 
+  gameLogger.info("Spielstart.", { sessionId: session.id, playerCount: players.length, isDebugSession: session.isDebugSession });
   await setSessionStatus(session.id, "starting");
   const shuffled = [...players].sort(() => Math.random() - 0.5);
   const impostorCount = players.length >= 8 ? 2 : 1;
@@ -146,8 +167,9 @@ export async function startGame(guild: Guild, sessionId: number): Promise<void> 
     const role = impostors.has(player.userId) ? "impostor" : "crewmate";
     await setPlayerRole(session.id, player.userId, role);
     for (const task of pickTasks(catalog, { short: session.shortTasks, medium: session.mediumTasks, long: session.longTasks })) {
-      await addTask(session.id, player.userId, task.type, task.description);
+      await addTask(session.id, player.userId, task);
     }
+    gameLogger.debug("Rolle und Tasks verteilt.", { sessionId: session.id, playerId: player.userId, role });
   }
 
   const refreshedSession = (await getSessionById(session.id)) as GameSession;
@@ -157,6 +179,9 @@ export async function startGame(guild: Guild, sessionId: number): Promise<void> 
 
   const assignedPlayers = await getPlayers(session.id);
   for (const player of assignedPlayers) {
+    if (player.isGhost || !player.discordUserId) {
+      continue;
+    }
     const member = await guild.members.fetch(player.userId);
     const channel = await createPrivatePlayerChannel(guild, refreshedSession.categoryId, player, member);
     await setPlayerChannel(session.id, player.userId, channel.id);
@@ -174,8 +199,14 @@ export async function completeTask(guild: Guild, taskId: number, userId: string)
   if (!existing) {
     throw new Error("Task nicht gefunden.");
   }
+  if (existing.steps.length > 0) {
+    throw new Error("Dieser Task hat mehrere Steps. Bitte erledige die Steps einzeln.");
+  }
+  if (existing.completed) {
+    throw new Error("Dieser Task ist bereits abgeschlossen.");
+  }
 
-  const session = await requireMutableSession(existing.sessionId);
+  const session = await requirePlayingSession(existing.sessionId);
   const player = await getPlayer(session.id, userId);
   if (!player) {
     throw new Error("Du bist nicht mehr Teil dieser Session.");
@@ -183,7 +214,7 @@ export async function completeTask(guild: Guild, taskId: number, userId: string)
   if (player.state === "removed") {
     throw new Error("Du bist nicht mehr Teil dieser Session.");
   }
-  if (player.role !== "crewmate" || player.state !== "alive") {
+  if (player.role !== "crewmate") {
     throw new Error("Nur Crewmates koennen echte Tasks erledigen.");
   }
 
@@ -195,6 +226,53 @@ export async function completeTask(guild: Guild, taskId: number, userId: string)
   await finishIfWinConditionReached(guild, task.sessionId);
   await sendAdminStatus(guild, task.sessionId);
   return task;
+}
+
+export async function completeTaskStep(
+  guild: Guild,
+  sessionId: number,
+  taskId: number,
+  stepRowId: number,
+  userId: string
+): Promise<{ task: PlayerTask; message: string }> {
+  const existing = await getTaskById(taskId);
+  const step = await getTaskStepById(stepRowId);
+  const session = await getSessionById(sessionId);
+  if (!existing || !step || step.assignedTaskId !== taskId || existing.sessionId !== sessionId || !session || session.status !== "playing") {
+    throw new Error("Diese Session ist nicht mehr aktiv.");
+  }
+
+  const player = await getPlayer(session.id, userId);
+  if (!player || player.state === "removed") {
+    throw new Error("Du bist nicht mehr Teil dieser Session.");
+  }
+  if (player.role !== "crewmate") {
+    throw new Error("Nur Crewmates koennen echte Tasks erledigen.");
+  }
+  if (existing.userId !== userId) {
+    throw new Error("Dieser Step gehoert nicht zu dir.");
+  }
+  if (existing.completed) {
+    return { task: existing, message: "Dieser Task ist bereits abgeschlossen." };
+  }
+  if (step.completed) {
+    return { task: existing, message: "Dieser Step ist bereits erledigt." };
+  }
+
+  await markTaskStepDone(taskId, stepRowId);
+  const task = await markTaskDoneIfAllStepsDone(taskId);
+  if (!task) {
+    throw new Error("Task nicht gefunden.");
+  }
+
+  if (task.completed) {
+    await finishIfWinConditionReached(guild, task.sessionId);
+    await sendAdminStatus(guild, task.sessionId);
+    return { task, message: `Task abgeschlossen: ${task.title}` };
+  }
+
+  await sendAdminStatus(guild, task.sessionId);
+  return { task, message: "Step als erledigt markiert." };
 }
 
 export async function killSelectMenu(guild: Guild, sessionId: number, impostorId: string): Promise<StringSelectMenuBuilder> {
@@ -237,9 +315,14 @@ export async function reportKill(guild: Guild, sessionId: number, killerId: stri
   await setPlayerState(session.id, victim.userId, "dead");
   await addKill(session.id, killer.userId, victim.userId);
   await setKillCooldown(session.id, killer.userId, Date.now() + config.killCooldownSeconds * 1000);
+  gameLogger.debug("Kill gemeldet.", { sessionId: session.id, killerId: killer.userId, victimId: victim.userId });
 
-  await sendToPlayerChannel(guild, victim, "Du bist tot. Bitte nimm nicht mehr aktiv am Spiel teil, bis die Spielleitung etwas anderes sagt.");
-  await sendAdminStatus(guild, session.id, `Kill gemeldet: <@${killer.userId}> hat <@${victim.userId}> getoetet.`);
+  await sendToPlayerChannel(
+    guild,
+    victim,
+    "Du wurdest getoetet. Du darfst weiterhin deine Tasks erledigen, aber nicht mehr voten, keine Leichen melden und keine Spielinformationen verraten."
+  );
+  await sendAdminStatus(guild, session.id, `Kill gemeldet: ${playerLabel(killer)} hat ${playerLabel(victim)} getoetet.`);
   await finishIfWinConditionReached(guild, session.id);
 }
 
@@ -309,18 +392,21 @@ export async function reportBody(guild: Guild, sessionId: number, reporterId: st
   for (const body of foundBodies) {
     await addReport(session.id, reporterId, location, body.userId);
   }
+  gameLogger.debug("Leiche gemeldet.", { sessionId: session.id, reporterId, bodyCount: foundBodies.length, location });
   await markDeathsReported(session.id, foundBodies.map((body) => body.userId));
   await clearVotes(session.id);
   await setSessionStatus(session.id, "meeting");
+  await setMeetingPhase(session.id, "called", { discussionStartedAt: null, votingStartedAt: null });
   await restartKillCooldowns(session.id);
-  await sendMeetingMessage(guild, session.id, reporterId, location, foundBodies);
+  await sendMeetingCalledMessage(guild, session.id, buildBodyReportReason(reporterId, location, foundBodies));
   await sendAdminStatus(guild, session.id);
 }
 
 async function handleFalseBodyReport(guild: Guild, session: GameSession, reporter: Player): Promise<number> {
   const warnings = await incrementFalseReportWarning(guild.id, reporter.userId);
   if (warnings < 2) {
-    await sendAdminStatus(guild, session.id, `<@${reporter.userId}> hat einen falschen Leichenreport ausgeloest. Verwarnung 1/2.`);
+    gameLogger.debug("False-Report erkannt.", { sessionId: session.id, reporterId: reporter.userId, warnings });
+    await sendAdminStatus(guild, session.id, `${playerLabel(reporter)} hat einen falschen Leichenreport ausgeloest. Verwarnung 1/2.`);
     return warnings;
   }
 
@@ -333,15 +419,15 @@ async function removePlayerForFalseReports(guild: Guild, session: GameSession, p
   const privateChannel = await getTextChannel(guild, player.channelId);
   await privateChannel?.send("Du wurdest wegen wiederholtem falschem Leichenmelden aus der Session entfernt.").catch(() => null);
   await privateChannel?.permissionOverwrites.edit(player.userId, { ViewChannel: false }).catch((error) => {
-    console.error(`Could not revoke private channel access for ${player.userId}`, error);
+    gameLogger.error(`Could not revoke private channel access for ${player.userId}.`, error);
   });
 
-  const publicMessage = `<@${player.userId}> wurde wegen wiederholtem falschem Leichenmelden aus der Session entfernt.`;
+  const publicMessage = `${playerLabel(player)} wurde wegen wiederholtem falschem Leichenmelden aus der Session entfernt.`;
   await sendPublicSessionMessage(guild, session, publicMessage);
   await sendAdminStatus(
     guild,
     session.id,
-    `<@${player.userId}> hat erneut einen falschen Leichenreport ausgeloest und wurde automatisch aus der Session entfernt. Verwarnungen: ${warnings}/2.`
+    `${playerLabel(player)} hat erneut einen falschen Leichenreport ausgeloest und wurde automatisch aus der Session entfernt. Verwarnungen: ${warnings}/2.`
   );
   await finishIfWinConditionReached(guild, session.id);
 }
@@ -350,16 +436,15 @@ export async function startAdminMeeting(guild: Guild, sessionId: number): Promis
   const session = await requirePlayingSession(sessionId);
   await clearVotes(session.id);
   await setSessionStatus(session.id, "meeting");
+  await setMeetingPhase(session.id, "called", { discussionStartedAt: null, votingStartedAt: null });
   await restartKillCooldowns(session.id);
-  await sendMeetingMessage(guild, session.id, "Admin hat Meeting gestartet");
+  gameLogger.debug("Meeting gestartet.", { sessionId: session.id, source: "admin" });
+  await sendMeetingCalledMessage(guild, session.id, "Admin hat Meeting gestartet");
   await sendAdminStatus(guild, session.id);
 }
 
 export async function startEmergencyMeeting(guild: Guild, sessionId: number, userId: string): Promise<void> {
   const session = await requireSession(sessionId);
-  if (userId !== session.emergencyUserId) {
-    throw new Error("Nur der festgelegte Emergency-User kann diesen Button verwenden.");
-  }
   if (session.status === "ended" || session.status === "cancelled") {
     throw new Error("Diese Session ist bereits beendet.");
   }
@@ -375,8 +460,10 @@ export async function startEmergencyMeeting(guild: Guild, sessionId: number, use
   await clearVotes(session.id);
   await setLastEmergencyMeetingAt(session.id, Date.now());
   await setSessionStatus(session.id, "meeting");
+  await setMeetingPhase(session.id, "called", { discussionStartedAt: null, votingStartedAt: null });
   await restartKillCooldowns(session.id);
-  await sendMeetingMessage(guild, session.id, `Emergency Meeting wurde einberufen.\nEinberufen durch <@${userId}>.`);
+  gameLogger.debug("Meeting gestartet.", { sessionId: session.id, source: "emergency", userId });
+  await sendMeetingCalledMessage(guild, session.id, `Emergency Meeting wurde einberufen.\nEinberufen durch ${playerLabel({ userId, discordUserId: userId, isGhost: false, username: userId })}.`);
   await sendAdminStatus(guild, session.id);
 }
 
@@ -398,6 +485,9 @@ export async function castVote(guild: Guild, sessionId: number, voterId: string,
   if (session.status !== "meeting") {
     throw new Error("Aktuell laeuft kein Meeting.");
   }
+  if (session.meetingPhase !== "voting") {
+    throw new Error("Das Voting wurde noch nicht gestartet.");
+  }
 
   const voter = await getPlayer(session.id, voterId);
   if (!voter || voter.state === "removed") {
@@ -408,15 +498,29 @@ export async function castVote(guild: Guild, sessionId: number, voterId: string,
   }
 
   await setVote(session.id, voterId, targetUserId);
+  gameLogger.debug("Stimme abgegeben.", { sessionId: session.id, voterId, targetUserId });
   const players = await getPlayers(session.id);
   const alivePlayers = players.filter((player) => player.state === "alive");
   const votes = await getVotes(session.id);
 
-  if (votes.length < alivePlayers.length) {
-    await sendAdminStatus(guild, session.id);
-    return `Vote gespeichert (${votes.length}/${alivePlayers.length}).`;
+  await sendAdminStatus(guild, session.id);
+  return `Vote gespeichert (${votes.length}/${alivePlayers.length}).`;
+}
+
+export async function evaluateVoting(guild: Guild, sessionId: number): Promise<string> {
+  const session = await requireSession(sessionId);
+  if (session.status === "ended" || session.status === "cancelled") {
+    throw new Error("Diese Session ist bereits beendet.");
+  }
+  if (session.status !== "meeting" || session.meetingPhase !== "voting") {
+    throw new Error("Aktuell laeuft kein Voting.");
   }
 
+  const players = await getPlayers(session.id);
+  const votes = await getVotes(session.id);
+  if (votes.length === 0) {
+    throw new Error("Es wurden noch keine Stimmen abgegeben.");
+  }
   const counts = new Map<string, number>();
   for (const vote of votes) {
     counts.set(vote.targetUserId, (counts.get(vote.targetUserId) || 0) + 1);
@@ -431,10 +535,12 @@ export async function castVote(guild: Guild, sessionId: number, voterId: string,
     await meeting?.send("Voting beendet: Niemand fliegt raus.");
   } else {
     await setPlayerState(session.id, winner, "ejected");
-    await meeting?.send(`Voting beendet: <@${winner}> wurde rausgewaehlt.`);
+    const winnerPlayer = players.find((player) => player.userId === winner);
+    await meeting?.send(`Voting beendet: ${winnerPlayer ? playerLabel(winnerPlayer) : winner} wurde rausgewaehlt.`);
   }
 
   await clearVotes(session.id);
+  await setMeetingPhase(session.id, "result");
   const ended = await finishIfWinConditionReached(guild, session.id);
   if (!ended) {
     await setSessionStatus(session.id, "playing");
@@ -443,7 +549,61 @@ export async function castVote(guild: Guild, sessionId: number, voterId: string,
   }
 
   await sendAdminStatus(guild, session.id);
+  gameLogger.debug("Voting ausgewertet.", { sessionId: session.id, votes: votes.length, winner });
   return "Voting abgeschlossen.";
+}
+
+export async function startMeetingDiscussion(guild: Guild, sessionId?: number): Promise<void> {
+  const session = sessionId ? await requireSession(sessionId) : await requireLatestActiveSession();
+  if (session.status !== "meeting" || session.meetingPhase !== "called") {
+    throw new Error("Diskussion kann nur in der Meetingphase called gestartet werden.");
+  }
+  const startedAt = Date.now();
+  await setMeetingPhase(session.id, "discussion", { discussionStartedAt: startedAt });
+  gameLogger.debug("Diskussion gestartet.", { sessionId: session.id, startedAt });
+  const meeting = await getTextChannel(guild, session.meetingChannelId);
+  await meeting?.send([
+    "**Diskussion gestartet.**",
+    `Diskussionszeit: ${session.discussionTimeMinutes} Minuten`,
+    `Gestartet um: ${formatClock(startedAt)}`
+  ].join("\n"));
+  await sendAdminStatus(guild, session.id);
+}
+
+export async function startMeetingVoting(guild: Guild, sessionId?: number): Promise<void> {
+  const session = sessionId ? await requireSession(sessionId) : await requireLatestActiveSession();
+  if (session.status !== "meeting" || (session.meetingPhase !== "discussion" && session.meetingPhase !== "called")) {
+    throw new Error("Voting kann nur in einer laufenden oder aufgerufenen Meetingphase gestartet werden.");
+  }
+  const startedAt = Date.now();
+  await clearVotes(session.id);
+  await setMeetingPhase(session.id, "voting", { votingStartedAt: startedAt });
+  gameLogger.debug("Voting gestartet.", { sessionId: session.id, startedAt });
+  await sendVotingMessage(guild, session.id, startedAt);
+  await sendAdminStatus(guild, session.id);
+}
+
+export async function startEmergencyMeetingFromWeb(guild: Guild): Promise<void> {
+  const session = await requireLatestActiveSession();
+  if (session.guildId !== guild.id) {
+    throw new Error("Aktive Session gehoert nicht zu diesem Server.");
+  }
+  if (session.status !== "playing") {
+    throw new Error("Gerade ist kein Emergency Meeting moeglich.");
+  }
+  const remaining = getEmergencyCooldownRemainingSeconds(session);
+  if (remaining > 0) {
+    throw new Error(`Emergency Meeting ist noch im Cooldown. Verbleibend: ${formatDuration(remaining)}.`);
+  }
+
+  await clearVotes(session.id);
+  await setLastEmergencyMeetingAt(session.id, Date.now());
+  await setSessionStatus(session.id, "meeting");
+  await setMeetingPhase(session.id, "called", { discussionStartedAt: null, votingStartedAt: null });
+  await restartKillCooldowns(session.id);
+  gameLogger.debug("Meeting gestartet.", { sessionId: session.id, source: "webpanel-emergency" });
+  await sendMeetingCalledMessage(guild, session.id, "Emergency Meeting wurde einberufen.");
+  await sendAdminStatus(guild, session.id);
 }
 
 export async function sendAdminStatus(guild: Guild, sessionId: number, prefix?: string): Promise<void> {
@@ -456,6 +616,127 @@ export async function sendAdminStatus(guild: Guild, sessionId: number, prefix?: 
     await admin.send(prefix);
   }
   await admin.send({ embeds: [await statusEmbed(session)] });
+}
+
+export async function getPublicWebPanelStatus(): Promise<object> {
+  const session = await getLatestSession();
+  if (!session) {
+    return { active: false, message: "Aktuell läuft keine Session." };
+  }
+
+  const votes = await getVotes(session.id);
+  const players = await getPlayers(session.id);
+  const tasks = await getTasks(session.id);
+  const progress = await getCrewmateTaskProgress(session.id, players, tasks);
+  const eligibleVoters = players.filter((player) => player.state === "alive");
+  const emergencyRemainingSeconds = getEmergencyCooldownRemainingSeconds(session);
+  const isActive = session.status !== "ended" && session.status !== "cancelled";
+
+  return {
+    active: isActive,
+    message: isActive ? undefined : "Session beendet.",
+    session: {
+      id: session.id,
+      guildId: session.guildId,
+      status: session.status,
+      meetingStatus: session.status === "meeting" ? session.meetingPhase : "none",
+      meetingPhase: session.meetingPhase,
+      discussionStartedAt: session.discussionStartedAt,
+      votingStartedAt: session.votingStartedAt,
+      discussionTimeMinutes: session.discussionTimeMinutes,
+      votingTimeMinutes: session.votingTimeMinutes,
+      endedAt: session.endedAt
+    },
+    taskProgress: progress,
+    emergency: {
+      cooldownReady: emergencyRemainingSeconds === 0,
+      cooldownRemainingSeconds: emergencyRemainingSeconds,
+      cooldownSeconds: session.emergencyCooldownSeconds,
+      lastEmergencyMeetingAt: session.lastEmergencyMeetingAt
+    },
+    voting: {
+      startedAt: session.votingStartedAt,
+      votesCast: votes.length,
+      eligibleVoters: eligibleVoters.length
+    },
+    meeting: {
+      phase: session.meetingPhase,
+      reason: session.status === "meeting" ? "Siehe Meeting-Kanal." : null,
+      discussionStartedAt: session.discussionStartedAt,
+      votingStartedAt: session.votingStartedAt,
+      discussionTimeMinutes: session.discussionTimeMinutes,
+      votingTimeMinutes: session.votingTimeMinutes
+    }
+  };
+}
+
+export async function getAdminPanelStatus(): Promise<object> {
+  const session = await getLatestSession();
+  if (!session) {
+    return { active: false, message: "Aktuell läuft keine Session." };
+  }
+
+  const players = await getPlayers(session.id);
+  const tasks = await getTasks(session.id);
+  const votes = await getVotes(session.id);
+  const progress = await getCrewmateTaskProgress(session.id, players, tasks);
+  const eligibleVoters = players.filter((player) => player.state === "alive");
+  const emergencyRemainingSeconds = getEmergencyCooldownRemainingSeconds(session);
+  const isActive = session.status !== "ended" && session.status !== "cancelled";
+
+  return {
+    active: isActive,
+    message: isActive ? undefined : "Session beendet.",
+    session: {
+      id: session.id,
+      guildId: session.guildId,
+      status: session.status,
+      meetingStatus: session.status === "meeting" ? session.meetingPhase : "none",
+      meetingPhase: session.meetingPhase,
+      discussionStartedAt: session.discussionStartedAt,
+      votingStartedAt: session.votingStartedAt,
+      discussionTimeMinutes: session.discussionTimeMinutes,
+      votingTimeMinutes: session.votingTimeMinutes,
+      endedAt: session.endedAt,
+      isDebugSession: session.isDebugSession,
+      ghostCount: session.ghostCount
+    },
+    players: {
+      total: players.length,
+      alive: players.filter((player) => player.state === "alive").length,
+      dead: players.filter((player) => player.state === "dead").length,
+      removed: players.filter((player) => player.state === "removed").length,
+      list: players.map((player) => ({
+        userId: player.userId,
+        isGhost: player.isGhost,
+        discordUserId: player.discordUserId,
+        username: player.username,
+        role: player.role,
+        state: player.state,
+        tasks: playerProgress(tasks.filter((task) => task.userId === player.userId))
+      }))
+    },
+    taskProgress: progress,
+    emergency: {
+      cooldownReady: emergencyRemainingSeconds === 0,
+      cooldownRemainingSeconds: emergencyRemainingSeconds,
+      cooldownSeconds: session.emergencyCooldownSeconds,
+      lastEmergencyMeetingAt: session.lastEmergencyMeetingAt
+    },
+    voting: {
+      startedAt: session.votingStartedAt,
+      votesCast: votes.length,
+      eligibleVoters: eligibleVoters.length
+    },
+    meeting: {
+      phase: session.meetingPhase,
+      reason: session.status === "meeting" ? "Siehe Meeting-Kanal." : null,
+      discussionStartedAt: session.discussionStartedAt,
+      votingStartedAt: session.votingStartedAt,
+      discussionTimeMinutes: session.discussionTimeMinutes,
+      votingTimeMinutes: session.votingTimeMinutes
+    }
+  };
 }
 
 export async function sendAdminControlsForSession(guild: Guild, sessionId: number): Promise<void> {
@@ -496,7 +777,7 @@ export async function deleteSessionChannels(guild: Guild, sessionId: number): Pr
       continue;
     }
     const deleted = await channel.delete("Among Us Session aufgeraeumt").then(() => true).catch((error) => {
-      console.error(`Session channel ${channelId} could not be deleted`, error);
+      gameLogger.error(`Session channel ${channelId} could not be deleted.`, error);
       return false;
     });
     if (!deleted) {
@@ -508,7 +789,7 @@ export async function deleteSessionChannels(guild: Guild, sessionId: number): Pr
   if (category?.type === ChannelType.GuildCategory && category.children.cache.size === 0) {
     await category.delete("Among Us Session aufgeraeumt").catch((error) => {
       failed.push(category.id);
-      console.error(`Session category ${category.id} could not be deleted`, error);
+      gameLogger.error(`Session category ${category.id} could not be deleted.`, error);
     });
   }
 
@@ -536,6 +817,125 @@ export async function refreshLobby(guild: Guild, sessionId: number): Promise<voi
   });
 }
 
+export async function listDebugPlayers(sessionId: number): Promise<string> {
+  const session = await requireDebugSession(sessionId);
+  const players = await getPlayers(session.id);
+  const tasks = await getTasks(session.id);
+  const ghosts = players.filter((player) => player.isGhost);
+  if (ghosts.length === 0) {
+    return "Keine Ghost-Spieler vorhanden.";
+  }
+
+  return ghosts.map((player) => {
+    const playerTasks = tasks.filter((task) => task.userId === player.userId);
+    return `${player.username} | ID: ${player.userId} | Rolle: ${player.role ?? "-"} | Status: ${player.state} | Tasks: ${playerProgress(playerTasks).done}/${playerTasks.length}`;
+  }).join("\n");
+}
+
+export async function debugCompleteTask(guild: Guild, sessionId: number, identifier: string): Promise<string> {
+  const session = await requireDebugSession(sessionId);
+  if (session.status !== "playing") {
+    throw new Error("Ghost-Tasks koennen nur waehrend des Spiels abgeschlossen werden.");
+  }
+
+  const player = await resolveGhostPlayer(session.id, identifier);
+  if (player.role !== "crewmate") {
+    throw new Error("Nur Ghost-Crewmates koennen ueber diesen Command Tasks erledigen.");
+  }
+
+  const tasks = await getTasks(session.id, player.userId);
+  const nextTask = tasks.find((task) => !task.completed);
+  if (!nextTask) {
+    throw new Error("Dieser Ghost-Spieler hat keine offenen Tasks mehr.");
+  }
+
+  const nextStep = nextTask.steps.find((step) => !step.completed);
+  if (nextStep) {
+    await markTaskStepDone(nextTask.id, nextStep.id);
+    const updatedTask = await markTaskDoneIfAllStepsDone(nextTask.id);
+    await finishIfWinConditionReached(guild, session.id);
+    await sendAdminStatus(guild, session.id, `Ghost-Task-Step erledigt: ${player.username} -> ${nextTask.title} / ${nextStep.title}`);
+    gameLogger.debug("Multi-Step-Task-Step erledigt.", { sessionId, playerId: player.userId, taskId: nextTask.id, stepId: nextStep.id });
+    return updatedTask?.completed
+      ? `${player.username} hat den letzten Step erledigt. Task abgeschlossen: ${nextTask.title}.`
+      : `${player.username} hat den Step "${nextStep.title}" erledigt.`;
+  }
+
+  await markTaskDone(nextTask.id, player.userId);
+  await finishIfWinConditionReached(guild, session.id);
+  await sendAdminStatus(guild, session.id, `Ghost-Task erledigt: ${player.username} -> ${nextTask.title}`);
+  gameLogger.debug("Task erledigt.", { sessionId, playerId: player.userId, taskId: nextTask.id });
+  return `${player.username} hat den Task "${nextTask.title}" erledigt.`;
+}
+
+export async function debugKillPlayer(guild: Guild, sessionId: number, identifier: string): Promise<string> {
+  const session = await requireDebugSession(sessionId);
+  if (session.status !== "playing") {
+    throw new Error("Ghost-Kills koennen nur waehrend des Spiels simuliert werden.");
+  }
+
+  const victim = await resolveGhostPlayer(session.id, identifier);
+  if (victim.state !== "alive") {
+    throw new Error("Dieser Ghost-Spieler lebt nicht mehr.");
+  }
+
+  await setPlayerState(session.id, victim.userId, "dead");
+  await addKill(session.id, "debug:system", victim.userId);
+  await sendAdminStatus(guild, session.id, `Debug-Kill: ${victim.username} wurde als tot markiert.`);
+  await finishIfWinConditionReached(guild, session.id);
+  gameLogger.debug("Ghost-Spieler getoetet.", { sessionId, victimId: victim.userId });
+  return `${victim.username} wurde als ungemeldete Leiche markiert.`;
+}
+
+export async function debugVote(guild: Guild, sessionId: number, voterIdentifier: string, targetIdentifier: string): Promise<string> {
+  const session = await requireDebugSession(sessionId);
+  if (session.status !== "meeting" || session.meetingPhase !== "voting") {
+    throw new Error("Ghost-Stimmen koennen nur waehrend einer Votingphase abgegeben werden.");
+  }
+
+  const voter = await resolveGhostPlayer(session.id, voterIdentifier);
+  if (voter.state !== "alive") {
+    throw new Error("Nur lebende Ghost-Spieler koennen abstimmen.");
+  }
+
+  const targetId = targetIdentifier.toLowerCase() === "skip"
+    ? "skip"
+    : (await resolvePlayerByIdentifier(session.id, targetIdentifier)).userId;
+
+  await setVote(session.id, voter.userId, targetId);
+  await sendAdminStatus(guild, session.id, `Ghost-Vote: ${voter.username} -> ${targetId === "skip" ? "skip" : labelForPlayerId(await getPlayers(session.id), targetId)}`);
+  gameLogger.debug("Ghost-Stimme abgegeben.", { sessionId, voterId: voter.userId, targetId });
+  const votes = await getVotes(session.id);
+  const players = await getPlayers(session.id);
+  return `Vote gespeichert (${votes.length}/${players.filter((player) => player.state === "alive").length}).`;
+}
+
+export async function kickPlayerFromAdmin(guild: Guild, playerId: string): Promise<string> {
+  const session = await requireLatestActiveSession();
+  const player = await getPlayer(session.id, playerId);
+  if (!player) {
+    throw new Error("Spieler ist nicht Teil der aktiven Session.");
+  }
+  if (player.state === "removed") {
+    throw new Error("Dieser Spieler wurde bereits entfernt.");
+  }
+
+  await setPlayerState(session.id, player.userId, "removed");
+  const privateChannel = await getTextChannel(guild, player.channelId);
+  await privateChannel?.send("Du wurdest aus der Session entfernt.").catch(() => null);
+  if (privateChannel) {
+    await privateChannel.delete("Spieler ueber Adminpanel aus der Session entfernt").catch((error) => {
+      gameLogger.error(`Private player channel ${privateChannel.id} could not be deleted after kick.`, error);
+    });
+  }
+
+  const message = `${playerLabel(player)}${player.isGhost ? " (Ghost)" : ""} wurde ueber das Adminpanel aus der Session entfernt.`;
+  await sendAdminStatus(guild, session.id, message);
+  await finishIfWinConditionReached(guild, session.id);
+  gameLogger.info("Spieler ueber Adminpanel entfernt.", { sessionId: session.id, playerId: player.userId, isGhost: player.isGhost });
+  return message;
+}
+
 async function finishIfWinConditionReached(guild: Guild, sessionId: number): Promise<boolean> {
   const session = await requireSession(sessionId);
   if (session.status === "ended" || session.status === "cancelled" || session.status === "lobby" || session.status === "starting") {
@@ -551,21 +951,60 @@ async function finishIfWinConditionReached(guild: Guild, sessionId: number): Pro
   const realTasks = tasks.filter((task) => crewmateIds.has(task.userId));
 
   if (realTasks.length > 0 && realTasks.every((task) => task.completed)) {
+    gameLogger.debug("Siegbedingungen geprueft.", { sessionId, result: "CrewmatesTasks" });
     await finishSession(guild, sessionId, "Crewmates", "alle Tasks erledigt");
     return true;
   }
 
   if (aliveImpostors.length === 0) {
+    gameLogger.debug("Siegbedingungen geprueft.", { sessionId, result: "CrewmatesImpostorsOut" });
     await finishSession(guild, sessionId, "Crewmates", "alle Impostors ausgeschieden");
     return true;
   }
 
   if (aliveImpostors.length >= aliveCrewmates.length) {
+    gameLogger.debug("Siegbedingungen geprueft.", { sessionId, result: "ImpostorsParity", aliveImpostors: aliveImpostors.length, aliveCrewmates: aliveCrewmates.length });
     await finishSession(guild, sessionId, "Impostors", "Impostors haben zahlenmaessige Mehrheit/Gleichstand erreicht");
     return true;
   }
 
+  gameLogger.debug("Siegbedingungen geprueft.", { sessionId, result: "continue", aliveImpostors: aliveImpostors.length, aliveCrewmates: aliveCrewmates.length });
   return false;
+}
+
+async function requireDebugSession(sessionId: number): Promise<GameSession> {
+  const session = await requireSession(sessionId);
+  if (!session.isDebugSession) {
+    throw new Error("Diese Funktion ist nur in Debug-Runden verfuegbar.");
+  }
+  return session;
+}
+
+async function resolveGhostPlayer(sessionId: number, identifier: string): Promise<Player> {
+  const player = await resolvePlayerByIdentifier(sessionId, identifier);
+  if (!player.isGhost) {
+    throw new Error("Bitte einen Ghost-Spieler angeben.");
+  }
+  return player;
+}
+
+async function resolvePlayerByIdentifier(sessionId: number, identifier: string): Promise<Player> {
+  const players = await getPlayers(sessionId);
+  const normalized = identifier.trim().toLowerCase();
+  const match = players.find((player) => player.userId.toLowerCase() === normalized || player.username.toLowerCase() === normalized);
+  if (!match) {
+    throw new Error(`Spieler nicht gefunden: ${identifier}`);
+  }
+  return match;
+}
+
+async function createGhostPlayers(sessionId: number, ghostCount: number): Promise<void> {
+  for (let index = 1; index <= ghostCount; index += 1) {
+    const userId = `ghost:${sessionId}:${index}`;
+    const username = `Ghost ${index}`;
+    await addPlayer(sessionId, userId, username, { discordUserId: null, isGhost: true });
+    gameLogger.debug("Ghost-Spieler hinzugefuegt.", { sessionId, userId, username });
+  }
 }
 
 async function finishSession(guild: Guild, sessionId: number, winner: Winner, reason: string): Promise<void> {
@@ -593,13 +1032,24 @@ async function finishSession(guild: Guild, sessionId: number, winner: Winner, re
   if (meeting && meeting.id !== registration?.id) {
     await meeting.send({ content: endText, embeds: [embed] });
   }
+  gameLogger.info("Spiel beendet.", { sessionId, winner, reason });
   await refreshLobby(guild, sessionId);
   await sendAdminStatus(guild, sessionId);
 }
 
-async function sendMeetingMessage(guild: Guild, sessionId: number, reason: string): Promise<void>;
-async function sendMeetingMessage(guild: Guild, sessionId: number, reporterId: string, location: string, foundBodies: Player[]): Promise<void>;
-async function sendMeetingMessage(guild: Guild, sessionId: number, first: string, second?: string, foundBodies?: Player[]): Promise<void> {
+function buildBodyReportReason(reporterId: string, location: string, foundBodies: Player[]): string {
+  return [
+    "Leiche gemeldet",
+    "",
+    `Gemeldet von: ${reporterId}`,
+    `Fundort: ${location}`,
+    "",
+    foundBodies.length === 1 ? "Gefundene Leiche:" : "Gefundene Leichen:",
+    ...foundBodies.map((body) => `- ${playerLabel(body)}`)
+  ].join("\n");
+}
+
+async function sendMeetingCalledMessage(guild: Guild, sessionId: number, reason: string): Promise<void> {
   const session = await requireSession(sessionId);
   const meeting = await getTextChannel(guild, session.meetingChannelId);
   if (!meeting) {
@@ -608,17 +1058,28 @@ async function sendMeetingMessage(guild: Guild, sessionId: number, first: string
 
   await clearMeetingChannel(meeting);
   const progress = await getCrewmateTaskProgress(session.id);
-  const reason = second && foundBodies
-    ? [
-        "Leiche gemeldet",
-        "",
-        `Gemeldet von: <@${first}>`,
-        `Fundort: ${second}`,
-        "",
-        foundBodies.length === 1 ? "Gefundene Leiche:" : "Gefundene Leichen:",
-        ...foundBodies.map((body) => `- <@${body.userId}>`)
-      ].join("\n")
-    : first;
+  await meeting.send({
+    content: [
+      "**Meeting wurde ausgeloest.**",
+      "",
+      `Grund: ${reason}`,
+      "",
+      "Bitte versammelt euch.",
+      "Die Diskussionszeit startet, sobald die Spielleitung sie im Webpanel startet.",
+      "",
+      "Task-Fortschritt:",
+      `${progress.done} / ${progress.total} erledigt`,
+      `${progress.percent} %`
+    ].join("\n")
+  });
+}
+
+async function sendVotingMessage(guild: Guild, sessionId: number, startedAt: number): Promise<void> {
+  const session = await requireSession(sessionId);
+  const meeting = await getTextChannel(guild, session.meetingChannelId);
+  if (!meeting) {
+    return;
+  }
   const players = (await getPlayers(sessionId)).filter((player) => player.state === "alive");
   const voteButtons = [
     ...players.map((player) =>
@@ -629,16 +1090,9 @@ async function sendMeetingMessage(guild: Guild, sessionId: number, first: string
 
   await meeting.send({
     content: [
-      "**Meeting gestartet**",
-      "",
-      `Grund: ${reason}`,
-      "",
-      `Diskussionszeit: ${session.discussionTimeMinutes} Minuten`,
+      "**Voting gestartet.**",
       `Votingzeit: ${session.votingTimeMinutes} Minuten`,
-      "",
-      "Task-Fortschritt:",
-      `${progress.done} / ${progress.total} erledigt`,
-      `${progress.percent} %`
+      `Gestartet um: ${formatClock(startedAt)}`
     ].join("\n"),
     components: chunkButtons(voteButtons)
   });
@@ -646,20 +1100,11 @@ async function sendMeetingMessage(guild: Guild, sessionId: number, first: string
 
 async function sendPlayerStartMessage(channel: TextChannel, player: Player, tasks: PlayerTask[]): Promise<void> {
   await channel.send(
-    `Deine Rolle: **${player.role}**\nDeine Tasks:\n${tasks.map((task, index) => `${index + 1}. [${task.taskType}] ${task.description}`).join("\n")}`
+    `Deine Rolle: **${player.role}**\nDeine Tasks:\n${tasks.map((task, index) => `${index + 1}. [${task.taskType}] ${task.title}`).join("\n")}`
   );
 
-  if (player.role === "crewmate") {
-    for (const task of tasks) {
-      await channel.send({
-        content: `[${task.taskType}] ${task.description}`,
-        components: [
-          new ActionRowBuilder<ButtonBuilder>().addComponents(
-            new ButtonBuilder().setCustomId(ids.taskDone(task.id)).setLabel("Erledigt").setStyle(ButtonStyle.Success)
-          )
-        ]
-      });
-    }
+  for (const task of tasks) {
+    await channel.send(taskMessageOptions(task, player.role === "crewmate"));
   }
 
   const actionButtons = [new ButtonBuilder().setCustomId(ids.reportBody(player.sessionId)).setLabel("Leiche melden").setStyle(ButtonStyle.Danger)];
@@ -673,6 +1118,88 @@ async function sendPlayerStartMessage(channel: TextChannel, player: Player, task
   });
 }
 
+export function taskMessageOptions(task: PlayerTask, canComplete: boolean) {
+  const content = task.steps.length > 0 ? multiStepTaskContent(task) : singleStepTaskContent(task);
+  if (!canComplete) {
+    return { content, components: [] };
+  }
+  if (task.steps.length === 0) {
+    return {
+      content,
+      components: task.completed
+        ? []
+        : [
+            new ActionRowBuilder<ButtonBuilder>().addComponents(
+              new ButtonBuilder().setCustomId(ids.taskDone(task.id)).setLabel("Erledigt").setStyle(ButtonStyle.Success)
+            )
+          ]
+    };
+  }
+
+  const buttons = task.steps.map((step, index) =>
+    new ButtonBuilder()
+      .setCustomId(ids.taskStepDone(task.sessionId, task.id, step.id))
+      .setLabel(`Step ${index + 1} erledigt`)
+      .setStyle(step.completed ? ButtonStyle.Secondary : ButtonStyle.Success)
+      .setDisabled(task.completed || step.completed)
+  );
+  return { content, components: chunkButtons(buttons) };
+}
+
+function singleStepTaskContent(task: PlayerTask): string {
+  return [
+    `${taskTypeLabel(task.taskType)}: ${task.title}`,
+    task.description !== task.title ? task.description : "",
+    task.location ? `Ort: ${task.location}` : "",
+    task.completed ? "Status: erledigt" : ""
+  ].filter(Boolean).join("\n");
+}
+
+function multiStepTaskContent(task: PlayerTask): string {
+  const done = task.steps.filter((step) => step.completed).length;
+  return [
+    `${taskTypeLabel(task.taskType)}: ${task.title}`,
+    task.description,
+    task.location ? `Ort: ${task.location}` : "",
+    "",
+    "Steps:",
+    ...task.steps.map((step) => `${step.completed ? "[x]" : "[ ]"} ${step.title}${step.description ? ` - ${step.description}` : ""}`),
+    "",
+    `Fortschritt: ${done}/${task.steps.length} Steps`
+  ].filter((line, index, lines) => line !== "" || lines[index - 1] !== "").join("\n");
+}
+
+function taskTypeLabel(taskType: PlayerTask["taskType"]): string {
+  if (taskType === "short") {
+    return "Short Task";
+  }
+  if (taskType === "medium") {
+    return "Medium Task";
+  }
+  return "Long Task";
+}
+
+function playerProgress(tasks: PlayerTask[]): { done: number; total: number } {
+  return { done: tasks.filter((task) => task.completed).length, total: tasks.length };
+}
+
+function labelForPlayerId(players: Player[], playerId: string | null): string {
+  if (!playerId) {
+    return "-";
+  }
+  if (playerId === "skip") {
+    return "skip";
+  }
+  if (playerId === "debug:system") {
+    return "Debug";
+  }
+  const player = players.find((entry) => entry.userId === playerId);
+  if (!player) {
+    return playerId;
+  }
+  return `${playerLabel(player)}${player.isGhost ? " (Ghost)" : ""}`;
+}
+
 async function statusEmbed(session: GameSession, revealRoles = true): Promise<EmbedBuilder> {
   const players = await getPlayers(session.id);
   const allTasks = await getTasks(session.id);
@@ -684,32 +1211,44 @@ async function statusEmbed(session: GameSession, revealRoles = true): Promise<Em
     return `${playerDisplay(player, allTasks.filter((task) => task.userId === player.userId), revealRoles)}${warningText}`;
   });
   const progress = await getCrewmateTaskProgress(session.id, players, allTasks);
+  const fields: Array<{ name: string; value: string; inline?: boolean }> = [
+    { name: "Spieler", value: lines.length ? lines.join("\n") : "Noch keine Spieler." },
+    { name: "Gesamtfortschritt Crewmates", value: progressLine(progress.done, progress.total), inline: true }
+  ];
+
+  if (session.isDebugSession) {
+    fields.push({ name: "Debug", value: `Ghost-Spieler: ${players.filter((player) => player.isGhost).length}`, inline: true });
+  }
+
+  fields.push(
+    {
+      name: "Emergency",
+      value: [
+        `Cooldown: ${formatEmergencyCooldown(session)}`,
+        `Webpanel: http://localhost:${config.webPanelPort}`,
+        "Emergency Meetings werden ueber das lokale Webpanel ausgeloest."
+      ].join("\n"),
+      inline: false
+    },
+    { name: "Kills", value: kills.length ? kills.map((kill) => `${labelForPlayerId(players, kill.killerId)} -> ${labelForPlayerId(players, kill.victimId)}`).join("\n") : "Keine", inline: false },
+    {
+      name: "Leichenmeldungen",
+      value: reports.length ? reports.map((report) => `${labelForPlayerId(players, report.reporterId)} - ${report.location}${report.victimId ? ` - ${labelForPlayerId(players, report.victimId)}` : ""}`).join("\n") : "Keine",
+      inline: false
+    },
+    {
+      name: "Falsche Leichenmeldungen",
+      value: warningMap.size > 0
+        ? [...warningMap.entries()].map(([userId, warnings]) => `${labelForPlayerId(players, userId)}: ${warnings}/2`).join("\n")
+        : "Keine",
+      inline: false
+    }
+  );
 
   return new EmbedBuilder()
     .setTitle(`AmongUs Session ${session.id}`)
-    .setDescription(`Status: ${session.status}`)
-    .addFields(
-      { name: "Spieler", value: lines.length ? lines.join("\n") : "Noch keine Spieler." },
-      { name: "Gesamtfortschritt Crewmates", value: progressLine(progress.done, progress.total), inline: true },
-      {
-        name: "Emergency",
-        value: `User: <@${session.emergencyUserId}>\nKanal: ${session.emergencyChannelId ? `<#${session.emergencyChannelId}>` : "nicht erstellt"}\nCooldown: ${formatEmergencyCooldown(session)}`,
-        inline: false
-      },
-      { name: "Kills", value: kills.length ? kills.map((kill) => `<@${kill.killerId}> -> <@${kill.victimId}>`).join("\n") : "Keine", inline: false },
-      {
-        name: "Leichenmeldungen",
-        value: reports.length ? reports.map((report) => `<@${report.reporterId}> - ${report.location}${report.victimId ? ` - <@${report.victimId}>` : ""}`).join("\n") : "Keine",
-        inline: false
-      },
-      {
-        name: "Falsche Leichenmeldungen",
-        value: warningMap.size > 0
-          ? [...warningMap.entries()].map(([userId, warnings]) => `<@${userId}>: ${warnings}/2`).join("\n")
-          : "Keine",
-        inline: false
-      }
-    );
+    .setDescription(`Status: ${session.status}${session.isDebugSession ? "\nDebug-Runde aktiv" : ""}`)
+    .addFields(...fields);
 }
 
 async function endSummaryEmbed(session: GameSession, winner: Winner, reason: string): Promise<EmbedBuilder> {
@@ -722,17 +1261,17 @@ async function endSummaryEmbed(session: GameSession, winner: Winner, reason: str
     .setTitle("Spiel beendet")
     .setDescription(`Gewinner: ${winner}\nGrund: ${reason}`)
     .addFields(
-      { name: "Rollen", value: players.map((player) => `<@${player.userId}> - ${player.role ?? "unbekannt"} - ${player.state}`).join("\n") },
+      { name: "Rollen", value: players.map((player) => `${playerLabel(player)}${player.isGhost ? " (Ghost)" : ""} - ${player.role ?? "unbekannt"} - ${player.state}`).join("\n") },
       { name: "Taskfortschritt", value: `Crewmates: ${progressLine(progress.done, progress.total)}` },
-      { name: "Kills", value: kills.length ? kills.map((kill) => `<@${kill.killerId}> -> <@${kill.victimId}>`).join("\n") : "Keine" }
+      { name: "Kills", value: kills.length ? kills.map((kill) => `${labelForPlayerId(players, kill.killerId)} -> ${labelForPlayerId(players, kill.victimId)}`).join("\n") : "Keine" }
     );
 }
 
 function lobbyEmbed(session: GameSession, players: Player[]): EmbedBuilder {
   return new EmbedBuilder()
     .setTitle(`AmongUs Anmeldung ${session.id}`)
-    .setDescription(`Status: ${session.status}\nSpieler: ${players.length}`)
-    .addFields({ name: "Angemeldet", value: players.length ? players.map((player) => `<@${player.userId}>`).join("\n") : "Noch niemand." });
+    .setDescription(`Status: ${session.status}\nSpieler: ${players.length}${session.isDebugSession ? `\nDebug-Runde mit ${session.ghostCount} Ghost-Spielern` : ""}`)
+    .addFields({ name: "Angemeldet", value: players.length ? players.map((player) => `${playerLabel(player)}${player.isGhost ? " (Ghost)" : ""}`).join("\n") : "Noch niemand." });
 }
 
 async function sendAdminControls(channel: TextChannel, session: GameSession): Promise<void> {
@@ -743,22 +1282,6 @@ async function sendAdminControls(channel: TextChannel, session: GameSession): Pr
         new ButtonBuilder().setCustomId(ids.deletePrompt(session.id)).setLabel("Session aufraeumen").setStyle(ButtonStyle.Danger),
         new ButtonBuilder().setCustomId(ids.adminStatus(session.id)).setLabel("Status aktualisieren").setStyle(ButtonStyle.Secondary),
         new ButtonBuilder().setCustomId(ids.start(session.id)).setLabel("Spiel starten").setStyle(ButtonStyle.Success)
-      )
-    ]
-  });
-}
-
-async function sendEmergencyPanel(channel: TextChannel, session: GameSession): Promise<void> {
-  await channel.send({
-    content: [
-      "**Emergency Meeting**",
-      "",
-      "Du bist der Emergency-User dieser Session.",
-      `Cooldown: ${formatEmergencyCooldown(session)}`
-    ].join("\n"),
-    components: [
-      new ActionRowBuilder<ButtonBuilder>().addComponents(
-        new ButtonBuilder().setCustomId(ids.emergencyMeeting(session.id)).setLabel("Emergency Meeting einberufen").setStyle(ButtonStyle.Danger)
       )
     ]
   });
@@ -777,7 +1300,7 @@ async function getOrCreateTextChannel(guild: Guild, parent: string, name: string
   const existing = guild.channels.cache.find((channel) => channel.type === ChannelType.GuildText && channel.name === name);
   if (existing?.type === ChannelType.GuildText) {
     if (existing.parentId !== parent) {
-      await existing.setParent(parent).catch((error) => console.error(`Could not move ${name}`, error));
+      await existing.setParent(parent).catch((error) => gameLogger.error(`Could not move ${name}.`, error));
     }
     return existing as TextChannel;
   }
@@ -788,7 +1311,7 @@ async function getOrCreateTextChannel(guild: Guild, parent: string, name: string
 async function getOrCreateSignupChannel(guild: Guild, parent: string, name: string, creatorId: string): Promise<TextChannel> {
   const channel = await getOrCreateTextChannel(guild, parent, name);
   await channel.permissionOverwrites.set(signupPermissionOverwrites(guild, creatorId)).catch((error) => {
-    console.error("Signup channel permissions could not be updated", error);
+    gameLogger.error("Signup channel permissions could not be updated.", error);
   });
   return channel;
 }
@@ -796,28 +1319,14 @@ async function getOrCreateSignupChannel(guild: Guild, parent: string, name: stri
 async function getOrCreateAdminChannel(guild: Guild, parent: string, name: string, creatorId: string): Promise<TextChannel> {
   const channel = await getOrCreateTextChannel(guild, parent, name);
   await channel.permissionOverwrites.set(adminPermissionOverwrites(guild, creatorId)).catch((error) => {
-    console.error("Admin channel permissions could not be updated", error);
-  });
-  return channel;
-}
-
-async function getOrCreateEmergencyChannel(
-  guild: Guild,
-  parent: string,
-  name: string,
-  emergencyUserId: string,
-  creatorId: string
-): Promise<TextChannel> {
-  const channel = await getOrCreateTextChannel(guild, parent, name);
-  await channel.permissionOverwrites.set(emergencyPermissionOverwrites(guild, emergencyUserId, creatorId)).catch((error) => {
-    console.error("Emergency channel permissions could not be updated", error);
+    gameLogger.error("Admin channel permissions could not be updated.", error);
   });
   return channel;
 }
 
 async function clearMeetingChannel(channel: TextChannel): Promise<void> {
   const messages = await channel.messages.fetch({ limit: 50 }).catch((error) => {
-    console.error("Meeting messages could not be fetched", error);
+    gameLogger.error("Meeting messages could not be fetched.", error);
     return null;
   });
   if (!messages || messages.size === 0) {
@@ -825,10 +1334,10 @@ async function clearMeetingChannel(channel: TextChannel): Promise<void> {
   }
 
   await channel.bulkDelete(messages, true).catch(async (error) => {
-    console.error("Meeting bulk delete failed", error);
+    gameLogger.error("Meeting bulk delete failed.", error);
     for (const message of messages.values()) {
       await message.delete().catch((deleteError) => {
-        console.error(`Meeting message ${message.id} could not be deleted`, deleteError);
+        gameLogger.error(`Meeting message ${message.id} could not be deleted.`, deleteError);
       });
     }
   });
@@ -836,7 +1345,7 @@ async function clearMeetingChannel(channel: TextChannel): Promise<void> {
 
 async function clearBotMessages(channel: TextChannel): Promise<void> {
   const messages = await channel.messages.fetch({ limit: 50 }).catch((error) => {
-    console.error(`Messages in ${channel.name} could not be fetched`, error);
+    gameLogger.error(`Messages in ${channel.name} could not be fetched.`, error);
     return null;
   });
   if (!messages) {
@@ -847,9 +1356,9 @@ async function clearBotMessages(channel: TextChannel): Promise<void> {
     return;
   }
   await channel.bulkDelete(botMessages, true).catch(async (error) => {
-    console.error(`Bot message bulk delete failed in ${channel.name}`, error);
+    gameLogger.error(`Bot message bulk delete failed in ${channel.name}.`, error);
     for (const message of botMessages.values()) {
-      await message.delete().catch((deleteError) => console.error(`Bot message ${message.id} could not be deleted`, deleteError));
+      await message.delete().catch((deleteError) => gameLogger.error(`Bot message ${message.id} could not be deleted.`, deleteError));
     }
   });
 }
@@ -861,7 +1370,7 @@ async function clearStalePrivatePlayerChannels(guild: Guild, categoryId: string)
 
   for (const channel of staleChannels.values()) {
     await channel.delete("Alten Among-Us-Spielerkanal vor neuer Session entfernt").catch((error) => {
-      console.error(`Stale private channel ${channel.id} could not be deleted`, error);
+      gameLogger.error(`Stale private channel ${channel.id} could not be deleted.`, error);
     });
   }
 }
@@ -885,6 +1394,15 @@ async function getCrewmateTaskProgress(
 function validateMeetingTimes(meetingTimes: { discussion: number; voting: number }): void {
   if (!isValidMeetingTime(meetingTimes.discussion) || !isValidMeetingTime(meetingTimes.voting)) {
     throw new Error("Diskussionszeit und Votingzeit muessen zwischen 1 und 15 Minuten liegen.");
+  }
+}
+
+function validateGhostCount(ghostCount: number): void {
+  if (!Number.isInteger(ghostCount) || ghostCount < 1) {
+    throw new Error("Bitte gib mindestens 1 Ghost-Spieler an.");
+  }
+  if (ghostCount > config.debugMaxGhostPlayers) {
+    throw new Error(`Maximal ${config.debugMaxGhostPlayers} Ghost-Spieler sind erlaubt.`);
   }
 }
 
@@ -946,17 +1464,6 @@ function signupPermissionOverwrites(guild: Guild, creatorId: string) {
     });
   }
 
-  return overwrites;
-}
-
-function emergencyPermissionOverwrites(guild: Guild, emergencyUserId: string, creatorId: string) {
-  const overwrites = adminPermissionOverwrites(guild, creatorId);
-  if (!overwrites.some((overwrite) => overwrite.id === emergencyUserId)) {
-    overwrites.push({
-      id: emergencyUserId,
-      allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.ReadMessageHistory]
-    });
-  }
   return overwrites;
 }
 
@@ -1042,6 +1549,10 @@ function formatDuration(totalSeconds: number): string {
   return `${minutes}:${seconds.toString().padStart(2, "0")}`;
 }
 
+function formatClock(timestamp: number): string {
+  return new Date(timestamp).toLocaleTimeString("de-CH", { hour: "2-digit", minute: "2-digit", second: "2-digit" });
+}
+
 function joinButton(session: GameSession): ButtonBuilder {
   return new ButtonBuilder().setCustomId(ids.join(session.id)).setLabel("Beitreten").setStyle(ButtonStyle.Primary);
 }
@@ -1070,6 +1581,14 @@ async function requireSession(sessionId: number): Promise<GameSession> {
   const session = await getSessionById(sessionId);
   if (!session) {
     throw new Error("Session nicht gefunden.");
+  }
+  return session;
+}
+
+async function requireLatestActiveSession(): Promise<GameSession> {
+  const session = await getLatestActiveSession();
+  if (!session) {
+    throw new Error("Keine aktive Session gefunden.");
   }
   return session;
 }

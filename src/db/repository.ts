@@ -1,4 +1,4 @@
-import { GameSession, Player, PlayerTask, PlayerRole, PlayerState, SessionStatus, TaskType, Vote } from "../models/session";
+import { CatalogTask, GameSession, MeetingPhase, Player, PlayerTask, PlayerTaskStep, PlayerRole, PlayerState, SessionStatus, TaskType, Vote } from "../models/session";
 import { getDb } from "./database";
 
 function mapSession(row: any): GameSession {
@@ -6,6 +6,8 @@ function mapSession(row: any): GameSession {
     id: row.id,
     guildId: row.guild_id,
     status: row.status,
+    isDebugSession: row.is_debug_session === 1,
+    ghostCount: row.ghost_count ?? 0,
     categoryId: row.category_id,
     lobbyChannelId: row.lobby_channel_id,
     meetingChannelId: row.meeting_channel_id,
@@ -16,6 +18,9 @@ function mapSession(row: any): GameSession {
     emergencyUserId: row.emergency_user_id,
     lastEmergencyMeetingAt: row.last_emergency_meeting_at,
     emergencyCooldownSeconds: row.emergency_cooldown_seconds,
+    meetingPhase: row.meeting_phase ?? "none",
+    discussionStartedAt: row.discussion_started_at,
+    votingStartedAt: row.voting_started_at,
     shortTasks: row.short_tasks,
     mediumTasks: row.medium_tasks,
     longTasks: row.long_tasks,
@@ -31,6 +36,8 @@ function mapPlayer(row: any): Player {
     id: row.id,
     sessionId: row.session_id,
     userId: row.user_id,
+    discordUserId: row.discord_user_id,
+    isGhost: row.is_ghost === 1,
     username: row.username,
     role: row.role,
     state: row.state,
@@ -46,31 +53,51 @@ function mapTask(row: any): PlayerTask {
     sessionId: row.session_id,
     userId: row.user_id,
     taskType: row.task_type,
+    taskId: row.task_id,
+    title: row.title || row.description,
     description: row.description,
-    completed: row.completed === 1
+    location: row.location,
+    completed: row.completed === 1,
+    completedAt: row.completed_at,
+    steps: []
+  };
+}
+
+function mapTaskStep(row: any): PlayerTaskStep {
+  return {
+    id: row.id,
+    assignedTaskId: row.assigned_task_id,
+    stepId: row.step_id,
+    title: row.title,
+    description: row.description,
+    completed: row.completed === 1,
+    completedAt: row.completed_at
   };
 }
 
 export async function createSession(
   guildId: string,
   createdBy: string,
-  emergencyUserId: string,
+  emergencyUserId: string | null,
   counts: { short: number; medium: number; long: number },
-  meetingTimes: { discussion: number; voting: number }
+  meetingTimes: { discussion: number; voting: number },
+  options: { isDebugSession?: boolean; ghostCount?: number } = {}
 ): Promise<GameSession> {
   const db = await getDb();
   const result = await db.run(
-    `INSERT INTO sessions (guild_id, status, created_by, emergency_user_id, emergency_cooldown_seconds, short_tasks, medium_tasks, long_tasks, discussion_time_minutes, voting_time_minutes)
-     VALUES (?, 'lobby', ?, ?, ?, ?, ?, ?, ?, ?)`,
+    `INSERT INTO sessions (guild_id, status, created_by, emergency_user_id, emergency_cooldown_seconds, short_tasks, medium_tasks, long_tasks, discussion_time_minutes, voting_time_minutes, is_debug_session, ghost_count)
+     VALUES (?, 'lobby', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     guildId,
     createdBy,
-    emergencyUserId,
+    emergencyUserId ?? "",
     Number(process.env.EMERGENCY_COOLDOWN_SECONDS || "300"),
     counts.short,
     counts.medium,
     counts.long,
     meetingTimes.discussion,
-    meetingTimes.voting
+    meetingTimes.voting,
+    options.isDebugSession ? 1 : 0,
+    options.ghostCount ?? 0
   );
   return getSessionById(result.lastID as number) as Promise<GameSession>;
 }
@@ -87,6 +114,18 @@ export async function getActiveSession(guildId: string): Promise<GameSession | n
     "SELECT * FROM sessions WHERE guild_id = ? AND status NOT IN ('ended', 'cancelled') ORDER BY id DESC LIMIT 1",
     guildId
   );
+  return row ? mapSession(row) : null;
+}
+
+export async function getLatestSession(): Promise<GameSession | null> {
+  const db = await getDb();
+  const row = await db.get("SELECT * FROM sessions ORDER BY id DESC LIMIT 1");
+  return row ? mapSession(row) : null;
+}
+
+export async function getLatestActiveSession(): Promise<GameSession | null> {
+  const db = await getDb();
+  const row = await db.get("SELECT * FROM sessions WHERE status NOT IN ('ended', 'cancelled') ORDER BY id DESC LIMIT 1");
   return row ? mapSession(row) : null;
 }
 
@@ -119,23 +158,60 @@ export async function setLastEmergencyMeetingAt(sessionId: number, timestamp: nu
   await db.run("UPDATE sessions SET last_emergency_meeting_at = ? WHERE id = ?", timestamp, sessionId);
 }
 
+export async function setMeetingPhase(
+  sessionId: number,
+  phase: MeetingPhase,
+  values: { discussionStartedAt?: number | null; votingStartedAt?: number | null } = {}
+): Promise<void> {
+  const db = await getDb();
+  await db.run(
+    `UPDATE sessions
+     SET meeting_phase = ?,
+         discussion_started_at = CASE WHEN ? THEN ? ELSE discussion_started_at END,
+         voting_started_at = CASE WHEN ? THEN ? ELSE voting_started_at END
+     WHERE id = ?`,
+    phase,
+    Object.prototype.hasOwnProperty.call(values, "discussionStartedAt") ? 1 : 0,
+    values.discussionStartedAt ?? null,
+    Object.prototype.hasOwnProperty.call(values, "votingStartedAt") ? 1 : 0,
+    values.votingStartedAt ?? null,
+    sessionId
+  );
+}
+
 export async function setSessionStatus(sessionId: number, status: SessionStatus): Promise<void> {
   const db = await getDb();
   await db.run(
-    "UPDATE sessions SET status = ?, ended_at = CASE WHEN ? = 'ended' THEN CURRENT_TIMESTAMP ELSE ended_at END WHERE id = ?",
+    `UPDATE sessions
+     SET status = ?,
+         ended_at = CASE WHEN ? = 'ended' THEN CURRENT_TIMESTAMP ELSE ended_at END,
+         meeting_phase = CASE WHEN ? IN ('playing', 'ended', 'cancelled') THEN 'none' ELSE meeting_phase END,
+         discussion_started_at = CASE WHEN ? IN ('playing', 'ended', 'cancelled') THEN NULL ELSE discussion_started_at END,
+         voting_started_at = CASE WHEN ? IN ('playing', 'ended', 'cancelled') THEN NULL ELSE voting_started_at END
+     WHERE id = ?`,
+    status,
+    status,
+    status,
     status,
     status,
     sessionId
   );
 }
 
-export async function addPlayer(sessionId: number, userId: string, username: string): Promise<void> {
+export async function addPlayer(
+  sessionId: number,
+  userId: string,
+  username: string,
+  options: { discordUserId?: string | null; isGhost?: boolean } = {}
+): Promise<void> {
   const db = await getDb();
   await db.run(
-    `INSERT OR IGNORE INTO players (session_id, user_id, username)
-     VALUES (?, ?, ?)`,
+    `INSERT OR IGNORE INTO players (session_id, user_id, discord_user_id, is_ghost, username)
+     VALUES (?, ?, ?, ?, ?)`,
     sessionId,
     userId,
+    options.discordUserId ?? userId,
+    options.isGhost ? 1 : 0,
     username
   );
 }
@@ -233,15 +309,28 @@ export async function getFalseReportWarningsForGuild(guildId: string): Promise<M
   return new Map(rows.map((row: any) => [row.user_id, row.warnings]));
 }
 
-export async function addTask(sessionId: number, userId: string, taskType: TaskType, description: string): Promise<void> {
+export async function addTask(sessionId: number, userId: string, task: CatalogTask): Promise<void> {
   const db = await getDb();
-  await db.run(
-    "INSERT INTO player_tasks (session_id, user_id, task_type, description) VALUES (?, ?, ?, ?)",
+  const result = await db.run(
+    "INSERT INTO player_tasks (session_id, user_id, task_type, task_id, title, description, location) VALUES (?, ?, ?, ?, ?, ?, ?)",
     sessionId,
     userId,
-    taskType,
-    description
+    task.category,
+    task.id,
+    task.title,
+    task.description,
+    task.location ?? null
   );
+  const assignedTaskId = result.lastID as number;
+  for (const step of task.steps ?? []) {
+    await db.run(
+      "INSERT INTO player_task_steps (assigned_task_id, step_id, title, description) VALUES (?, ?, ?, ?)",
+      assignedTaskId,
+      step.id,
+      step.title,
+      step.description ?? null
+    );
+  }
 }
 
 export async function getTasks(sessionId: number, userId?: string): Promise<PlayerTask[]> {
@@ -249,20 +338,71 @@ export async function getTasks(sessionId: number, userId?: string): Promise<Play
   const rows = userId
     ? await db.all("SELECT * FROM player_tasks WHERE session_id = ? AND user_id = ? ORDER BY id ASC", sessionId, userId)
     : await db.all("SELECT * FROM player_tasks WHERE session_id = ? ORDER BY id ASC", sessionId);
-  return rows.map(mapTask);
+  return attachTaskSteps(rows.map(mapTask));
 }
 
 export async function getTaskById(taskId: number): Promise<PlayerTask | null> {
   const db = await getDb();
   const row = await db.get("SELECT * FROM player_tasks WHERE id = ?", taskId);
-  return row ? mapTask(row) : null;
+  if (!row) {
+    return null;
+  }
+  const [task] = await attachTaskSteps([mapTask(row)]);
+  return task;
 }
 
 export async function markTaskDone(taskId: number, userId: string): Promise<PlayerTask | null> {
   const db = await getDb();
-  await db.run("UPDATE player_tasks SET completed = 1 WHERE id = ? AND user_id = ?", taskId, userId);
+  await db.run("UPDATE player_tasks SET completed = 1, completed_at = COALESCE(completed_at, CURRENT_TIMESTAMP) WHERE id = ? AND user_id = ?", taskId, userId);
   const row = await db.get("SELECT * FROM player_tasks WHERE id = ?", taskId);
-  return row ? mapTask(row) : null;
+  if (!row) {
+    return null;
+  }
+  const [task] = await attachTaskSteps([mapTask(row)]);
+  return task;
+}
+
+export async function getTaskStepById(stepRowId: number): Promise<PlayerTaskStep | null> {
+  const db = await getDb();
+  const row = await db.get("SELECT * FROM player_task_steps WHERE id = ?", stepRowId);
+  return row ? mapTaskStep(row) : null;
+}
+
+export async function markTaskStepDone(assignedTaskId: number, stepRowId: number): Promise<PlayerTaskStep | null> {
+  const db = await getDb();
+  await db.run(
+    "UPDATE player_task_steps SET completed = 1, completed_at = COALESCE(completed_at, CURRENT_TIMESTAMP) WHERE id = ? AND assigned_task_id = ?",
+    stepRowId,
+    assignedTaskId
+  );
+  const row = await db.get("SELECT * FROM player_task_steps WHERE id = ? AND assigned_task_id = ?", stepRowId, assignedTaskId);
+  return row ? mapTaskStep(row) : null;
+}
+
+export async function markTaskDoneIfAllStepsDone(taskId: number): Promise<PlayerTask | null> {
+  const db = await getDb();
+  const openStep = await db.get("SELECT id FROM player_task_steps WHERE assigned_task_id = ? AND completed = 0 LIMIT 1", taskId);
+  if (!openStep) {
+    await db.run("UPDATE player_tasks SET completed = 1, completed_at = COALESCE(completed_at, CURRENT_TIMESTAMP) WHERE id = ?", taskId);
+  }
+  return getTaskById(taskId);
+}
+
+async function attachTaskSteps(tasks: PlayerTask[]): Promise<PlayerTask[]> {
+  if (tasks.length === 0) {
+    return tasks;
+  }
+  const db = await getDb();
+  const placeholders = tasks.map(() => "?").join(",");
+  const rows = await db.all(`SELECT * FROM player_task_steps WHERE assigned_task_id IN (${placeholders}) ORDER BY id ASC`, ...tasks.map((task) => task.id));
+  const stepsByTask = new Map<number, PlayerTaskStep[]>();
+  for (const row of rows) {
+    const step = mapTaskStep(row);
+    const steps = stepsByTask.get(step.assignedTaskId) ?? [];
+    steps.push(step);
+    stepsByTask.set(step.assignedTaskId, steps);
+  }
+  return tasks.map((task) => ({ ...task, steps: stepsByTask.get(task.id) ?? [] }));
 }
 
 export async function addReport(sessionId: number, reporterId: string, location: string, victimId: string | null = null): Promise<void> {
