@@ -252,8 +252,7 @@ export async function markFragwuerdigContinue(guild: Guild, sessionId: number, u
 export async function endFragwuerdigByHost(guild: Guild, sessionId: number, userId: string, isAdmin: boolean): Promise<string> {
   const session = await requireFragwuerdigSession(sessionId);
   assertHostOrAdmin(session, userId, isAdmin, "Nur Host oder Spielleitung kann diese Session beenden.");
-  await finishFragwuerdigSession(guild, session.id, "Session wurde beendet.");
-  return "Fragwuerdig-Session beendet.";
+  return finishFragwuerdigSession(guild, session.id, "Session wurde beendet.");
 }
 
 export async function refreshFragwuerdigLobby(guild: Guild, sessionId: number): Promise<void> {
@@ -352,14 +351,15 @@ async function revealFragwuerdigRound(guild: Guild, session: GameSession, round:
   await refreshFragwuerdigLobby(guild, session.id);
 }
 
-async function finishFragwuerdigSession(guild: Guild, sessionId: number, reason: string): Promise<void> {
+async function finishFragwuerdigSession(guild: Guild, sessionId: number, reason: string): Promise<string> {
   const session = await requireFragwuerdigSession(sessionId);
   if (session.status === "finished") {
-    return;
+    return deleteFragwuerdigChannels(guild, session.id);
   }
   await setSessionStatus(session.id, "finished");
   await refreshFragwuerdigLobby(guild, session.id);
-  for (const player of await getPlayers(session.id)) {
+  const players = await getPlayers(session.id);
+  for (const player of players) {
     const state = await getFragwuerdigPlayerState(session.id, player.userId);
     await deleteActivePlayerMessage(guild, player, state?.activeMessageId ?? null);
     await setFragwuerdigPlayerActiveMessage(session.id, player.userId, null);
@@ -370,6 +370,37 @@ async function finishFragwuerdigSession(guild: Guild, sessionId: number, reason:
   const admin = await getTextChannel(guild, session.adminChannelId);
   await meeting?.send(`Fragwuerdig beendet. ${reason}`).catch(() => null);
   await admin?.send(`Fragwuerdig beendet. ${reason}`).catch(() => null);
+  return deleteFragwuerdigChannels(guild, session.id, players);
+}
+
+async function deleteFragwuerdigChannels(guild: Guild, sessionId: number, players?: Player[]): Promise<string> {
+  const session = await requireFragwuerdigSession(sessionId);
+  const sessionPlayers = players ?? await getPlayers(session.id);
+  const idsToDelete = [
+    session.lobbyChannelId,
+    session.meetingChannelId,
+    session.adminChannelId,
+    ...sessionPlayers.map((player) => player.channelId)
+  ].filter(Boolean) as string[];
+
+  const failed: string[] = [];
+  for (const channelId of new Set(idsToDelete)) {
+    const channel = await guild.channels.fetch(channelId).catch(() => null);
+    if (!channel) {
+      continue;
+    }
+    const deleted = await channel.delete("Fragwuerdig-Session aufgeraeumt").then(() => true).catch((error) => {
+      console.error(`Fragwuerdig channel ${channelId} could not be deleted`, error);
+      return false;
+    });
+    if (!deleted) {
+      failed.push(channelId);
+    }
+  }
+
+  return failed.length
+    ? `Fragwuerdig beendet. Einige Session-Kanaele konnten nicht geloescht werden: ${failed.map((id) => `<#${id}>`).join(", ")}`
+    : "Fragwuerdig beendet und alle Session-Kanaele wurden geloescht.";
 }
 
 async function sendQuestionToPlayer(guild: Guild, sessionId: number, player: Player, round: FragwuerdigRound): Promise<void> {
