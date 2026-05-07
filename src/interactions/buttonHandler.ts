@@ -1,6 +1,13 @@
 import { ActionRowBuilder, ButtonBuilder, ButtonInteraction, ButtonStyle, GuildMember, MessageFlags } from "discord.js";
 import { getActiveSession } from "../db/repository";
 import { isAdminInteraction } from "../services/authService";
+import { cancelCrazyPostSession, joinCrazyPostSession, startCrazyPostGame } from "../services/crazyPostService";
+import {
+  endFragwuerdigByHost,
+  joinFragwuerdigSession,
+  markFragwuerdigContinue,
+  startFragwuerdigRound
+} from "../services/fragwuerdigService";
 import {
   cancelAndDeleteSession,
   canOpenBodyReportModal,
@@ -29,6 +36,16 @@ export async function handleButton(interaction: ButtonInteraction): Promise<void
   }
 
   const parts = parseCustomId(interaction.customId);
+  if (parts[0] === "post") {
+    await handleCrazyPostButton(interaction, parts);
+    return;
+  }
+
+  if (parts[0] === "frag") {
+    await handleFragwuerdigButton(interaction, parts);
+    return;
+  }
+
   if (parts[0] !== "amongus") {
     return;
   }
@@ -175,6 +192,86 @@ export async function handleButton(interaction: ButtonInteraction): Promise<void
       }
       await interaction.deferReply({ flags: MessageFlags.Ephemeral });
       const result = await deleteSessionChannels(interaction.guild, Number(parts[2]));
+      await interaction.editReply(result);
+      return;
+    }
+
+    await safeReply(interaction, "Diese Interaktion ist nicht mehr aktiv.");
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "Unbekannter Fehler.";
+    await safeReply(interaction, message);
+  }
+}
+
+async function handleFragwuerdigButton(interaction: ButtonInteraction, parts: string[]): Promise<void> {
+  try {
+    const action = parts[1];
+    const sessionId = Number(parts[2]);
+
+    if (action === "join") {
+      await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+      const message = await joinFragwuerdigSession(interaction.guild!, sessionId, interaction.member as GuildMember);
+      await interaction.editReply(message);
+      return;
+    }
+
+    if (action === "start" || action === "next") {
+      await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+      await startFragwuerdigRound(interaction.guild!, sessionId, interaction.user.id, isAdminInteraction(interaction));
+      await interaction.editReply("Fragwuerdig-Runde gestartet.");
+      return;
+    }
+
+    if (action === "continue") {
+      await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+      const message = await markFragwuerdigContinue(interaction.guild!, sessionId, interaction.user.id, true);
+      await interaction.editReply(message);
+      return;
+    }
+
+    if (action === "stop") {
+      await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+      const message = await markFragwuerdigContinue(interaction.guild!, sessionId, interaction.user.id, false);
+      await interaction.editReply(message);
+      return;
+    }
+
+    if (action === "cancel" || action === "end") {
+      await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+      const message = await endFragwuerdigByHost(interaction.guild!, sessionId, interaction.user.id, isAdminInteraction(interaction));
+      await interaction.editReply(message);
+      return;
+    }
+
+    await safeReply(interaction, "Diese Interaktion ist nicht mehr aktiv.");
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "Unbekannter Fehler.";
+    await safeReply(interaction, message);
+  }
+}
+
+async function handleCrazyPostButton(interaction: ButtonInteraction, parts: string[]): Promise<void> {
+  try {
+    const action = parts[1];
+    const sessionId = Number(parts[2]);
+
+    if (action === "join") {
+      await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+      await joinCrazyPostSession(interaction.guild!, sessionId, interaction.member as GuildMember);
+      await interaction.editReply("Du bist der Verrueckte-Post-Session beigetreten.");
+      return;
+    }
+
+    if (action === "start") {
+      await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+      await startCrazyPostGame(interaction.guild!, sessionId, interaction.user.id, isAdminInteraction(interaction));
+      await interaction.editReply("Verrueckte Post gestartet.");
+      return;
+    }
+
+    if (action === "delete") {
+      await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+      const result = await cancelCrazyPostSession(interaction.guild!, sessionId, interaction.user.id, isAdminInteraction(interaction));
       await interaction.editReply(result);
       return;
     }

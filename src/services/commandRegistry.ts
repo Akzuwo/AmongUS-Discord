@@ -78,9 +78,46 @@ export const amongUsCommand = new SlashCommandBuilder()
   .addSubcommand((subcommand) => subcommand.setName("status").setDescription("Status der aktuellen Session anzeigen"))
   .addSubcommand((subcommand) => subcommand.setName("end").setDescription("Aktuelle Session beenden"));
 
+export const crazyPostCommand = new SlashCommandBuilder()
+  .setName("verruecktepost")
+  .setDescription("Verrueckte Post Minigame starten")
+  .addStringOption((option) =>
+    option
+      .setName("reihenfolge")
+      .setDescription("Weitergabe-Reihenfolge")
+      .setRequired(true)
+      .addChoices(
+        { name: "statisch", value: "static" },
+        { name: "zufaellig", value: "random" }
+      )
+  );
+
+export const gameCommand = new SlashCommandBuilder()
+  .setName("game")
+  .setDescription("Minigames verwalten")
+  .addSubcommand((subcommand) =>
+    subcommand
+      .setName("start")
+      .setDescription("Ein Minigame starten")
+      .addStringOption((option) =>
+        option
+          .setName("spiel")
+          .setDescription("Spiel")
+          .setRequired(true)
+          .addChoices({ name: "fragwuerdig", value: "fragwuerdig" })
+      )
+      .addIntegerOption((option) =>
+        option
+          .setName("impostor_anzahl")
+          .setDescription("Anzahl Impostors")
+          .setRequired(true)
+          .addChoices({ name: "1", value: 1 }, { name: "2", value: 2 })
+      )
+  );
+
 export async function registerCommands(): Promise<void> {
   const rest = new REST({ version: "10" }).setToken(config.token);
-  const body = [amongUsCommand.toJSON()];
+  const body = [amongUsCommand.toJSON(), crazyPostCommand.toJSON(), gameCommand.toJSON()];
 
   if (config.guildId) {
     await rest.put(Routes.applicationGuildCommands(config.clientId, config.guildId), { body });

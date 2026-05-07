@@ -90,6 +90,10 @@ export async function handleAmongUsCommand(interaction: ChatInputCommandInteract
       await interaction.editReply("Keine aktive Session gefunden.");
       return;
     }
+    if (session.gameType !== "amongus") {
+      await interaction.editReply(`Aktuell laeuft Session ${session.id}, aber sie ist keine Among-Us-Session.`);
+      return;
+    }
 
     if (subcommand === "debug-list") {
       await interaction.editReply(await listDebugPlayers(session.id));
