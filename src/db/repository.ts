@@ -1,13 +1,38 @@
-import { CatalogTask, GameSession, MeetingPhase, Player, PlayerTask, PlayerTaskStep, PlayerRole, PlayerState, SessionStatus, TaskType, Vote } from "../models/session";
+import {
+  CatalogTask,
+  CrazyPostOrderMode,
+  CrazyPostPlayerState,
+  CrazyPostSentence,
+  CrazyPostText,
+  FragwuerdigAnswer,
+  FragwuerdigAnswerType,
+  FragwuerdigPlayerQueueState,
+  FragwuerdigPlayerState,
+  FragwuerdigRound,
+  FragwuerdigSettings,
+  FragwuerdigVote,
+  GameSession,
+  MeetingPhase,
+  Player,
+  PlayerTask,
+  PlayerTaskStep,
+  PlayerRole,
+  PlayerState,
+  SessionStatus,
+  TaskType,
+  Vote
+} from "../models/session";
 import { getDb } from "./database";
 
 function mapSession(row: any): GameSession {
   return {
     id: row.id,
     guildId: row.guild_id,
+    gameType: row.game_type ?? "amongus",
     status: row.status,
     isDebugSession: row.is_debug_session === 1,
     ghostCount: row.ghost_count ?? 0,
+    orderMode: row.order_mode,
     categoryId: row.category_id,
     lobbyChannelId: row.lobby_channel_id,
     meetingChannelId: row.meeting_channel_id,
@@ -28,6 +53,91 @@ function mapSession(row: any): GameSession {
     votingTimeMinutes: row.voting_time_minutes,
     createdAt: row.created_at,
     endedAt: row.ended_at
+  };
+}
+
+function mapCrazyPostText(row: any): CrazyPostText {
+  return {
+    id: row.id,
+    sessionId: row.session_id,
+    originUserId: row.origin_user_id,
+    route: JSON.parse(row.route_json),
+    currentStepIndex: row.current_step_index,
+    finished: row.finished === 1,
+    createdAt: row.created_at
+  };
+}
+
+function mapCrazyPostSentence(row: any): CrazyPostSentence {
+  return {
+    id: row.id,
+    textId: row.text_id,
+    authorId: row.author_id,
+    content: row.content,
+    createdAt: row.created_at
+  };
+}
+
+function mapCrazyPostPlayerState(row: any): CrazyPostPlayerState {
+  return {
+    sessionId: row.session_id,
+    userId: row.user_id,
+    activeMessageId: row.active_message_id,
+    activeTextId: row.active_text_id
+  };
+}
+
+function mapFragwuerdigSettings(row: any): FragwuerdigSettings {
+  return {
+    sessionId: row.session_id,
+    impostorCount: row.impostor_count,
+    roundNumber: row.round_number,
+    usedQuestionPairIds: JSON.parse(row.used_question_pair_ids_json)
+  };
+}
+
+function mapFragwuerdigPlayerState(row: any): FragwuerdigPlayerState {
+  return {
+    sessionId: row.session_id,
+    userId: row.user_id,
+    queueState: row.queue_state,
+    activeMessageId: row.active_message_id,
+    wantsToContinue: row.wants_to_continue === null || row.wants_to_continue === undefined ? null : row.wants_to_continue === 1
+  };
+}
+
+function mapFragwuerdigRound(row: any): FragwuerdigRound {
+  return {
+    id: row.id,
+    sessionId: row.session_id,
+    roundNumber: row.round_number,
+    questionPairId: row.question_pair_id,
+    mainQuestion: row.main_question,
+    impostorQuestion: row.impostor_question,
+    answerType: row.answer_type,
+    impostorIds: JSON.parse(row.impostor_ids_json),
+    status: row.status,
+    createdAt: row.created_at
+  };
+}
+
+function mapFragwuerdigAnswer(row: any): FragwuerdigAnswer {
+  return {
+    id: row.id,
+    roundId: row.round_id,
+    playerId: row.player_id,
+    answerText: row.answer_text,
+    createdAt: row.created_at
+  };
+}
+
+function mapFragwuerdigVote(row: any): FragwuerdigVote {
+  return {
+    id: row.id,
+    roundId: row.round_id,
+    voterId: row.voter_id,
+    targetPlayerIds: JSON.parse(row.target_player_ids_json),
+    createdAt: row.created_at
   };
 }
 
@@ -102,6 +212,31 @@ export async function createSession(
   return getSessionById(result.lastID as number) as Promise<GameSession>;
 }
 
+export async function createCrazyPostSession(guildId: string, createdBy: string, orderMode: CrazyPostOrderMode): Promise<GameSession> {
+  const db = await getDb();
+  const result = await db.run(
+    `INSERT INTO sessions (guild_id, game_type, status, order_mode, created_by, emergency_user_id, short_tasks, medium_tasks, long_tasks)
+     VALUES (?, 'crazy_post', 'lobby', ?, ?, '', 0, 0, 0)`,
+    guildId,
+    orderMode,
+    createdBy
+  );
+  return getSessionById(result.lastID as number) as Promise<GameSession>;
+}
+
+export async function createFragwuerdigSession(guildId: string, createdBy: string, impostorCount: 1 | 2): Promise<GameSession> {
+  const db = await getDb();
+  const result = await db.run(
+    `INSERT INTO sessions (guild_id, game_type, status, created_by, emergency_user_id, short_tasks, medium_tasks, long_tasks)
+     VALUES (?, 'fragwuerdig', 'lobby', ?, '', 0, 0, 0)`,
+    guildId,
+    createdBy
+  );
+  const sessionId = result.lastID as number;
+  await db.run("INSERT INTO fragwuerdig_settings (session_id, impostor_count) VALUES (?, ?)", sessionId, impostorCount);
+  return getSessionById(sessionId) as Promise<GameSession>;
+}
+
 export async function getSessionById(sessionId: number): Promise<GameSession | null> {
   const db = await getDb();
   const row = await db.get("SELECT * FROM sessions WHERE id = ?", sessionId);
@@ -111,7 +246,7 @@ export async function getSessionById(sessionId: number): Promise<GameSession | n
 export async function getActiveSession(guildId: string): Promise<GameSession | null> {
   const db = await getDb();
   const row = await db.get(
-    "SELECT * FROM sessions WHERE guild_id = ? AND status NOT IN ('ended', 'cancelled') ORDER BY id DESC LIMIT 1",
+    "SELECT * FROM sessions WHERE guild_id = ? AND status NOT IN ('ended', 'cancelled', 'finished') ORDER BY id DESC LIMIT 1",
     guildId
   );
   return row ? mapSession(row) : null;
@@ -125,7 +260,47 @@ export async function getLatestSession(): Promise<GameSession | null> {
 
 export async function getLatestActiveSession(): Promise<GameSession | null> {
   const db = await getDb();
-  const row = await db.get("SELECT * FROM sessions WHERE status NOT IN ('ended', 'cancelled') ORDER BY id DESC LIMIT 1");
+  const row = await db.get("SELECT * FROM sessions WHERE status NOT IN ('ended', 'cancelled', 'finished') ORDER BY id DESC LIMIT 1");
+  return row ? mapSession(row) : null;
+}
+
+export async function getAnyActiveSession(): Promise<GameSession | null> {
+  const db = await getDb();
+  const row = await db.get(
+    "SELECT * FROM sessions WHERE status NOT IN ('ended', 'cancelled', 'finished') ORDER BY id DESC LIMIT 1"
+  );
+  return row ? mapSession(row) : null;
+}
+
+export async function getActiveFragwuerdigSessionByChannel(channelId: string): Promise<GameSession | null> {
+  const db = await getDb();
+  const row = await db.get(
+    `SELECT sessions.*
+     FROM sessions
+     JOIN players ON players.session_id = sessions.id
+     WHERE sessions.game_type = 'fragwuerdig'
+       AND sessions.status IN ('answering', 'voting', 'round_finished')
+       AND players.channel_id = ?
+     ORDER BY sessions.id DESC
+     LIMIT 1`,
+    channelId
+  );
+  return row ? mapSession(row) : null;
+}
+
+export async function getActiveCrazyPostSessionByChannel(channelId: string): Promise<GameSession | null> {
+  const db = await getDb();
+  const row = await db.get(
+    `SELECT sessions.*
+     FROM sessions
+     JOIN players ON players.session_id = sessions.id
+     WHERE sessions.game_type = 'crazy_post'
+       AND sessions.status = 'playing'
+       AND players.channel_id = ?
+     ORDER BY sessions.id DESC
+     LIMIT 1`,
+    channelId
+  );
   return row ? mapSession(row) : null;
 }
 
@@ -468,4 +643,234 @@ export async function getVotes(sessionId: number): Promise<Vote[]> {
   const db = await getDb();
   const rows = await db.all("SELECT * FROM votes WHERE session_id = ?", sessionId);
   return rows.map((row: any) => ({ sessionId: row.session_id, voterId: row.voter_id, targetUserId: row.target_user_id }));
+}
+
+export async function addCrazyPostText(sessionId: number, originUserId: string, route: string[]): Promise<CrazyPostText> {
+  const db = await getDb();
+  const result = await db.run(
+    "INSERT INTO crazy_post_texts (session_id, origin_user_id, route_json) VALUES (?, ?, ?)",
+    sessionId,
+    originUserId,
+    JSON.stringify(route)
+  );
+  return getCrazyPostTextById(result.lastID as number) as Promise<CrazyPostText>;
+}
+
+export async function getCrazyPostTextById(textId: number): Promise<CrazyPostText | null> {
+  const db = await getDb();
+  const row = await db.get("SELECT * FROM crazy_post_texts WHERE id = ?", textId);
+  return row ? mapCrazyPostText(row) : null;
+}
+
+export async function getCrazyPostTexts(sessionId: number): Promise<CrazyPostText[]> {
+  const db = await getDb();
+  const rows = await db.all("SELECT * FROM crazy_post_texts WHERE session_id = ? ORDER BY id ASC", sessionId);
+  return rows.map(mapCrazyPostText);
+}
+
+export async function getNextCrazyPostTextForPlayer(sessionId: number, userId: string): Promise<CrazyPostText | null> {
+  const texts = await getCrazyPostTexts(sessionId);
+  return texts.find((text) => !text.finished && text.route[text.currentStepIndex] === userId) ?? null;
+}
+
+export async function addCrazyPostSentence(textId: number, authorId: string, content: string): Promise<void> {
+  const db = await getDb();
+  await db.run("INSERT INTO crazy_post_sentences (text_id, author_id, content) VALUES (?, ?, ?)", textId, authorId, content);
+}
+
+export async function getCrazyPostSentences(textId: number): Promise<CrazyPostSentence[]> {
+  const db = await getDb();
+  const rows = await db.all("SELECT * FROM crazy_post_sentences WHERE text_id = ? ORDER BY id ASC", textId);
+  return rows.map(mapCrazyPostSentence);
+}
+
+export async function advanceCrazyPostText(textId: number, nextStepIndex: number, finished: boolean): Promise<void> {
+  const db = await getDb();
+  await db.run("UPDATE crazy_post_texts SET current_step_index = ?, finished = ? WHERE id = ?", nextStepIndex, finished ? 1 : 0, textId);
+}
+
+export async function ensureCrazyPostPlayerState(sessionId: number, userId: string): Promise<void> {
+  const db = await getDb();
+  await db.run(
+    "INSERT OR IGNORE INTO crazy_post_player_state (session_id, user_id) VALUES (?, ?)",
+    sessionId,
+    userId
+  );
+}
+
+export async function getCrazyPostPlayerState(sessionId: number, userId: string): Promise<CrazyPostPlayerState | null> {
+  const db = await getDb();
+  const row = await db.get("SELECT * FROM crazy_post_player_state WHERE session_id = ? AND user_id = ?", sessionId, userId);
+  return row ? mapCrazyPostPlayerState(row) : null;
+}
+
+export async function setCrazyPostPlayerState(
+  sessionId: number,
+  userId: string,
+  values: Pick<CrazyPostPlayerState, "activeMessageId" | "activeTextId">
+): Promise<void> {
+  const db = await getDb();
+  await db.run(
+    `INSERT INTO crazy_post_player_state (session_id, user_id, active_message_id, active_text_id)
+     VALUES (?, ?, ?, ?)
+     ON CONFLICT(session_id, user_id)
+     DO UPDATE SET active_message_id = excluded.active_message_id, active_text_id = excluded.active_text_id`,
+    sessionId,
+    userId,
+    values.activeMessageId,
+    values.activeTextId
+  );
+}
+
+export async function getFragwuerdigSettings(sessionId: number): Promise<FragwuerdigSettings | null> {
+  const db = await getDb();
+  const row = await db.get("SELECT * FROM fragwuerdig_settings WHERE session_id = ?", sessionId);
+  return row ? mapFragwuerdigSettings(row) : null;
+}
+
+export async function updateFragwuerdigSettings(
+  sessionId: number,
+  values: Partial<Pick<FragwuerdigSettings, "roundNumber" | "usedQuestionPairIds">>
+): Promise<void> {
+  const db = await getDb();
+  const current = await getFragwuerdigSettings(sessionId);
+  await db.run(
+    "UPDATE fragwuerdig_settings SET round_number = ?, used_question_pair_ids_json = ? WHERE session_id = ?",
+    values.roundNumber ?? current?.roundNumber ?? 0,
+    JSON.stringify(values.usedQuestionPairIds ?? current?.usedQuestionPairIds ?? []),
+    sessionId
+  );
+}
+
+export async function ensureFragwuerdigPlayerState(
+  sessionId: number,
+  userId: string,
+  queueState: FragwuerdigPlayerQueueState = "active"
+): Promise<void> {
+  const db = await getDb();
+  await db.run(
+    `INSERT INTO fragwuerdig_player_state (session_id, user_id, queue_state)
+     VALUES (?, ?, ?)
+     ON CONFLICT(session_id, user_id)
+     DO UPDATE SET queue_state = CASE WHEN queue_state = 'left' THEN excluded.queue_state ELSE queue_state END`,
+    sessionId,
+    userId,
+    queueState
+  );
+}
+
+export async function getFragwuerdigPlayerStates(sessionId: number, queueState?: FragwuerdigPlayerQueueState): Promise<FragwuerdigPlayerState[]> {
+  const db = await getDb();
+  const rows = queueState
+    ? await db.all("SELECT * FROM fragwuerdig_player_state WHERE session_id = ? AND queue_state = ? ORDER BY user_id ASC", sessionId, queueState)
+    : await db.all("SELECT * FROM fragwuerdig_player_state WHERE session_id = ? ORDER BY user_id ASC", sessionId);
+  return rows.map(mapFragwuerdigPlayerState);
+}
+
+export async function getFragwuerdigPlayerState(sessionId: number, userId: string): Promise<FragwuerdigPlayerState | null> {
+  const db = await getDb();
+  const row = await db.get("SELECT * FROM fragwuerdig_player_state WHERE session_id = ? AND user_id = ?", sessionId, userId);
+  return row ? mapFragwuerdigPlayerState(row) : null;
+}
+
+export async function setFragwuerdigPlayerQueueState(
+  sessionId: number,
+  userId: string,
+  queueState: FragwuerdigPlayerQueueState
+): Promise<void> {
+  const db = await getDb();
+  await db.run("UPDATE fragwuerdig_player_state SET queue_state = ?, wants_to_continue = NULL WHERE session_id = ? AND user_id = ?", queueState, sessionId, userId);
+}
+
+export async function setFragwuerdigPlayerActiveMessage(sessionId: number, userId: string, messageId: string | null): Promise<void> {
+  const db = await getDb();
+  await db.run("UPDATE fragwuerdig_player_state SET active_message_id = ? WHERE session_id = ? AND user_id = ?", messageId, sessionId, userId);
+}
+
+export async function setFragwuerdigWantsToContinue(sessionId: number, userId: string, wantsToContinue: boolean): Promise<void> {
+  const db = await getDb();
+  await db.run("UPDATE fragwuerdig_player_state SET wants_to_continue = ? WHERE session_id = ? AND user_id = ?", wantsToContinue ? 1 : 0, sessionId, userId);
+}
+
+export async function resetFragwuerdigContinueMarks(sessionId: number): Promise<void> {
+  const db = await getDb();
+  await db.run("UPDATE fragwuerdig_player_state SET wants_to_continue = NULL WHERE session_id = ?", sessionId);
+}
+
+export async function promoteFragwuerdigWaitingPlayers(sessionId: number): Promise<void> {
+  const db = await getDb();
+  await db.run("UPDATE fragwuerdig_player_state SET queue_state = 'active', wants_to_continue = NULL WHERE session_id = ? AND queue_state = 'waiting'", sessionId);
+}
+
+export async function createFragwuerdigRound(
+  sessionId: number,
+  roundNumber: number,
+  questionPair: { id: string; mainQuestion: string; impostorQuestion: string; answerType: FragwuerdigAnswerType },
+  impostorIds: string[]
+): Promise<FragwuerdigRound> {
+  const db = await getDb();
+  const result = await db.run(
+    `INSERT INTO fragwuerdig_rounds
+       (session_id, round_number, question_pair_id, main_question, impostor_question, answer_type, impostor_ids_json, status)
+     VALUES (?, ?, ?, ?, ?, ?, ?, 'answering')`,
+    sessionId,
+    roundNumber,
+    questionPair.id,
+    questionPair.mainQuestion,
+    questionPair.impostorQuestion,
+    questionPair.answerType,
+    JSON.stringify(impostorIds)
+  );
+  return getFragwuerdigRoundById(result.lastID as number) as Promise<FragwuerdigRound>;
+}
+
+export async function getFragwuerdigRoundById(roundId: number): Promise<FragwuerdigRound | null> {
+  const db = await getDb();
+  const row = await db.get("SELECT * FROM fragwuerdig_rounds WHERE id = ?", roundId);
+  return row ? mapFragwuerdigRound(row) : null;
+}
+
+export async function getCurrentFragwuerdigRound(sessionId: number): Promise<FragwuerdigRound | null> {
+  const db = await getDb();
+  const row = await db.get("SELECT * FROM fragwuerdig_rounds WHERE session_id = ? ORDER BY round_number DESC, id DESC LIMIT 1", sessionId);
+  return row ? mapFragwuerdigRound(row) : null;
+}
+
+export async function setFragwuerdigRoundStatus(roundId: number, status: FragwuerdigRound["status"]): Promise<void> {
+  const db = await getDb();
+  await db.run("UPDATE fragwuerdig_rounds SET status = ? WHERE id = ?", status, roundId);
+}
+
+export async function addFragwuerdigAnswer(roundId: number, playerId: string, answerText: string): Promise<boolean> {
+  const db = await getDb();
+  const result = await db.run(
+    "INSERT OR IGNORE INTO fragwuerdig_answers (round_id, player_id, answer_text) VALUES (?, ?, ?)",
+    roundId,
+    playerId,
+    answerText
+  );
+  return (result.changes ?? 0) > 0;
+}
+
+export async function getFragwuerdigAnswers(roundId: number): Promise<FragwuerdigAnswer[]> {
+  const db = await getDb();
+  const rows = await db.all("SELECT * FROM fragwuerdig_answers WHERE round_id = ? ORDER BY id ASC", roundId);
+  return rows.map(mapFragwuerdigAnswer);
+}
+
+export async function addFragwuerdigVote(roundId: number, voterId: string, targetPlayerIds: string[]): Promise<boolean> {
+  const db = await getDb();
+  const result = await db.run(
+    "INSERT OR IGNORE INTO fragwuerdig_votes (round_id, voter_id, target_player_ids_json) VALUES (?, ?, ?)",
+    roundId,
+    voterId,
+    JSON.stringify(targetPlayerIds)
+  );
+  return (result.changes ?? 0) > 0;
+}
+
+export async function getFragwuerdigVotes(roundId: number): Promise<FragwuerdigVote[]> {
+  const db = await getDb();
+  const rows = await db.all("SELECT * FROM fragwuerdig_votes WHERE round_id = ? ORDER BY id ASC", roundId);
+  return rows.map(mapFragwuerdigVote);
 }

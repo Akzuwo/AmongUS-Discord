@@ -1,11 +1,15 @@
 import { Client, Events, GatewayIntentBits } from "discord.js";
 import { config } from "./config";
 import { handleAmongUsCommand } from "./commands/amongus";
+import { handleCrazyPostCommand } from "./commands/crazyPost";
+import { handleGameCommand } from "./commands/game";
 import { initDb } from "./db/database";
 import { handleButton } from "./interactions/buttonHandler";
 import { handleModal } from "./interactions/modalHandler";
 import { handleSelect } from "./interactions/selectHandler";
 import { registerCommands } from "./services/commandRegistry";
+import { handleCrazyPostPlayerMessage } from "./services/crazyPostService";
+import { handleFragwuerdigPlayerMessage } from "./services/fragwuerdigService";
 import { isExpectedInteractionError, safeReply } from "./utils/interactionResponses";
 import { logger } from "./utils/logger";
 import { startWebPanel } from "./webPanel";
@@ -17,7 +21,7 @@ async function main(): Promise<void> {
   await initDb();
 
   const client = new Client({
-    intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMembers]
+    intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMembers, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent]
   });
 
   startWebPanel(client);
@@ -36,6 +40,16 @@ async function main(): Promise<void> {
       if (interaction.isChatInputCommand() && interaction.commandName === "amongus") {
         appLogger.debug("Slash Command ausgefuehrt.", { subcommand: interaction.options.getSubcommand(), userId: interaction.user.id });
         await handleAmongUsCommand(interaction);
+        return;
+      }
+
+      if (interaction.isChatInputCommand() && interaction.commandName === "verruecktepost") {
+        await handleCrazyPostCommand(interaction);
+        return;
+      }
+
+      if (interaction.isChatInputCommand() && interaction.commandName === "game") {
+        await handleGameCommand(interaction);
         return;
       }
 
@@ -59,6 +73,18 @@ async function main(): Promise<void> {
       if (interaction.isRepliable()) {
         await safeReply(interaction, "Es ist ein Fehler aufgetreten. Bitte versuche es erneut oder informiere die Spielleitung.");
       }
+    }
+  });
+
+  client.on(Events.MessageCreate, async (message) => {
+    try {
+      if (await handleFragwuerdigPlayerMessage(message)) {
+        return;
+      }
+      await handleCrazyPostPlayerMessage(message);
+    } catch (error) {
+      console.error("Unhandled message error", error);
+      await message.reply("Es ist ein Fehler aufgetreten. Bitte informiere die Spielleitung.").catch(() => null);
     }
   });
 
