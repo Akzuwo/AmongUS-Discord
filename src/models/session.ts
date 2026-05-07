@@ -1,4 +1,8 @@
-export type SessionStatus = "lobby" | "starting" | "playing" | "meeting" | "ended" | "cancelled";
+export type SessionStatus = "lobby" | "starting" | "playing" | "meeting" | "answering" | "voting" | "round_finished" | "finished" | "ended" | "cancelled";
+export type GameType = "amongus" | "crazy_post" | "fragwuerdig";
+export type CrazyPostOrderMode = "static" | "random";
+export type FragwuerdigAnswerType = "number" | "text" | "rating" | "time" | "choice";
+export type FragwuerdigPlayerQueueState = "active" | "waiting" | "left";
 export type MeetingPhase = "none" | "called" | "discussion" | "voting" | "result";
 export type PlayerRole = "crewmate" | "impostor";
 export type PlayerState = "alive" | "dead" | "ejected" | "removed";
@@ -7,9 +11,11 @@ export type TaskType = "short" | "medium" | "long";
 export interface GameSession {
   id: number;
   guildId: string;
+  gameType: GameType;
   status: SessionStatus;
   isDebugSession: boolean;
   ghostCount: number;
+  orderMode: CrazyPostOrderMode | null;
   categoryId: string | null;
   lobbyChannelId: string | null;
   meetingChannelId: string | null;
@@ -95,4 +101,81 @@ export interface Vote {
   sessionId: number;
   voterId: string;
   targetUserId: string;
+}
+
+export interface CrazyPostText {
+  id: number;
+  sessionId: number;
+  originUserId: string;
+  route: string[];
+  currentStepIndex: number;
+  finished: boolean;
+  createdAt: string;
+}
+
+export interface CrazyPostSentence {
+  id: number;
+  textId: number;
+  authorId: string;
+  content: string;
+  createdAt: string;
+}
+
+export interface CrazyPostPlayerState {
+  sessionId: number;
+  userId: string;
+  activeMessageId: string | null;
+  activeTextId: number | null;
+}
+
+export interface FragwuerdigQuestionPair {
+  id: string;
+  mainQuestion: string;
+  impostorQuestion: string;
+  answerType: FragwuerdigAnswerType;
+  category?: string;
+}
+
+export interface FragwuerdigSettings {
+  sessionId: number;
+  impostorCount: 1 | 2;
+  roundNumber: number;
+  usedQuestionPairIds: string[];
+}
+
+export interface FragwuerdigPlayerState {
+  sessionId: number;
+  userId: string;
+  queueState: FragwuerdigPlayerQueueState;
+  activeMessageId: string | null;
+  wantsToContinue: boolean | null;
+}
+
+export interface FragwuerdigRound {
+  id: number;
+  sessionId: number;
+  roundNumber: number;
+  questionPairId: string;
+  mainQuestion: string;
+  impostorQuestion: string;
+  answerType: FragwuerdigAnswerType;
+  impostorIds: string[];
+  status: "answering" | "voting" | "revealed" | "finished";
+  createdAt: string;
+}
+
+export interface FragwuerdigAnswer {
+  id: number;
+  roundId: number;
+  playerId: string;
+  answerText: string;
+  createdAt: string;
+}
+
+export interface FragwuerdigVote {
+  id: number;
+  roundId: number;
+  voterId: string;
+  targetPlayerIds: string[];
+  createdAt: string;
 }

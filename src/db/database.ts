@@ -27,9 +27,11 @@ export async function initDb(): Promise<void> {
     CREATE TABLE IF NOT EXISTS sessions (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       guild_id TEXT NOT NULL,
+      game_type TEXT NOT NULL DEFAULT 'amongus',
       status TEXT NOT NULL,
       is_debug_session INTEGER NOT NULL DEFAULT 0,
       ghost_count INTEGER NOT NULL DEFAULT 0,
+      order_mode TEXT,
       category_id TEXT,
       lobby_channel_id TEXT,
       meeting_channel_id TEXT,
@@ -137,7 +139,92 @@ export async function initDb(): Promise<void> {
       updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
       PRIMARY KEY(guild_id, user_id)
     );
+
+    CREATE TABLE IF NOT EXISTS crazy_post_texts (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      session_id INTEGER NOT NULL,
+      origin_user_id TEXT NOT NULL,
+      route_json TEXT NOT NULL,
+      current_step_index INTEGER NOT NULL DEFAULT 0,
+      finished INTEGER NOT NULL DEFAULT 0,
+      created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      FOREIGN KEY(session_id) REFERENCES sessions(id) ON DELETE CASCADE
+    );
+
+    CREATE TABLE IF NOT EXISTS crazy_post_sentences (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      text_id INTEGER NOT NULL,
+      author_id TEXT NOT NULL,
+      content TEXT NOT NULL,
+      created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      UNIQUE(text_id, author_id),
+      FOREIGN KEY(text_id) REFERENCES crazy_post_texts(id) ON DELETE CASCADE
+    );
+
+    CREATE TABLE IF NOT EXISTS crazy_post_player_state (
+      session_id INTEGER NOT NULL,
+      user_id TEXT NOT NULL,
+      active_message_id TEXT,
+      active_text_id INTEGER,
+      PRIMARY KEY(session_id, user_id),
+      FOREIGN KEY(session_id) REFERENCES sessions(id) ON DELETE CASCADE,
+      FOREIGN KEY(active_text_id) REFERENCES crazy_post_texts(id) ON DELETE SET NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS fragwuerdig_settings (
+      session_id INTEGER PRIMARY KEY,
+      impostor_count INTEGER NOT NULL,
+      round_number INTEGER NOT NULL DEFAULT 0,
+      used_question_pair_ids_json TEXT NOT NULL DEFAULT '[]',
+      FOREIGN KEY(session_id) REFERENCES sessions(id) ON DELETE CASCADE
+    );
+
+    CREATE TABLE IF NOT EXISTS fragwuerdig_player_state (
+      session_id INTEGER NOT NULL,
+      user_id TEXT NOT NULL,
+      queue_state TEXT NOT NULL DEFAULT 'active',
+      active_message_id TEXT,
+      wants_to_continue INTEGER,
+      PRIMARY KEY(session_id, user_id),
+      FOREIGN KEY(session_id) REFERENCES sessions(id) ON DELETE CASCADE
+    );
+
+    CREATE TABLE IF NOT EXISTS fragwuerdig_rounds (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      session_id INTEGER NOT NULL,
+      round_number INTEGER NOT NULL,
+      question_pair_id TEXT NOT NULL,
+      main_question TEXT NOT NULL,
+      impostor_question TEXT NOT NULL,
+      answer_type TEXT NOT NULL,
+      impostor_ids_json TEXT NOT NULL,
+      status TEXT NOT NULL,
+      created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      FOREIGN KEY(session_id) REFERENCES sessions(id) ON DELETE CASCADE
+    );
+
+    CREATE TABLE IF NOT EXISTS fragwuerdig_answers (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      round_id INTEGER NOT NULL,
+      player_id TEXT NOT NULL,
+      answer_text TEXT NOT NULL,
+      created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      UNIQUE(round_id, player_id),
+      FOREIGN KEY(round_id) REFERENCES fragwuerdig_rounds(id) ON DELETE CASCADE
+    );
+
+    CREATE TABLE IF NOT EXISTS fragwuerdig_votes (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      round_id INTEGER NOT NULL,
+      voter_id TEXT NOT NULL,
+      target_player_ids_json TEXT NOT NULL,
+      created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      UNIQUE(round_id, voter_id),
+      FOREIGN KEY(round_id) REFERENCES fragwuerdig_rounds(id) ON DELETE CASCADE
+    );
   `);
+  await ensureColumn(database, "sessions", "game_type", "TEXT NOT NULL DEFAULT 'amongus'");
+  await ensureColumn(database, "sessions", "order_mode", "TEXT");
   await ensureColumn(database, "reports", "victim_id", "TEXT");
   await ensureColumn(database, "sessions", "discussion_time_minutes", "INTEGER NOT NULL DEFAULT 3");
   await ensureColumn(database, "sessions", "voting_time_minutes", "INTEGER NOT NULL DEFAULT 2");

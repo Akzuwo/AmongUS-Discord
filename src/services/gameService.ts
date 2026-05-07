@@ -25,6 +25,7 @@ import {
   clearFalseReportWarnings,
   clearVotes,
   createSession,
+  getAnyActiveSession,
   getActiveSession,
   getLatestActiveSession,
   getLatestSession,
@@ -72,7 +73,7 @@ export async function createGameSession(
   options: { isDebugSession?: boolean; ghostCount?: number } = {}
 ): Promise<GameSession> {
   validateMeetingTimes(meetingTimes);
-  const active = await getActiveSession(guild.id);
+  const active = await getAnyActiveSession();
   if (active) {
     throw new Error(`Es gibt bereits eine aktive Session: ${active.id}`);
   }
@@ -135,6 +136,9 @@ export async function createDebugGameSession(
 
 export async function joinSession(guild: Guild, sessionId: number, member: GuildMember): Promise<void> {
   const session = await requireSession(sessionId);
+  if (session.gameType !== "amongus") {
+    throw new Error("Diese Session ist keine Among-Us-Session.");
+  }
   if (session.guildId !== guild.id || session.status !== "lobby") {
     throw new Error("Dieser Session kann nicht mehr beigetreten werden.");
   }
@@ -147,6 +151,9 @@ export async function joinSession(guild: Guild, sessionId: number, member: Guild
 
 export async function startGame(guild: Guild, sessionId: number): Promise<void> {
   const session = await requireSession(sessionId);
+  if (session.gameType !== "amongus") {
+    throw new Error("Diese Session ist keine Among-Us-Session.");
+  }
   if (session.status !== "lobby") {
     throw new Error("Die Session ist nicht in der Anmeldephase.");
   }
