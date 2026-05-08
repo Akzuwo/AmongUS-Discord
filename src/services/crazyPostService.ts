@@ -75,6 +75,7 @@ export async function createCrazyPostGameSession(
   if (signupCreated) {
     await addSessionChannel(session.id, signup.id, "crazy_post_signup", true);
   }
+  await addSessionChannel(session.id, admin.id, "crazy_post_admin", true);
 
   await updateSessionChannels(session.id, {
     categoryId: category.id,
@@ -484,11 +485,13 @@ async function deleteCrazyPostChannels(guild: Guild, sessionId: number): Promise
   const session = await requireCrazyPostSession(sessionId);
   const protectedIds = new Set(
     [
-      session.adminChannelId,
       await findTextChannelIdByName(guild, TEXT_COLLECTION_CHANNEL_NAME)
     ].filter(Boolean) as string[]
   );
   const temporaryChannelIds = new Set(await getTemporarySessionChannelIds(session.id));
+  if (session.adminChannelId) {
+    temporaryChannelIds.add(session.adminChannelId);
+  }
 
   const failed: string[] = [];
   for (const channelId of temporaryChannelIds) {
