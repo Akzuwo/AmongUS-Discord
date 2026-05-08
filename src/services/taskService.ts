@@ -1,6 +1,8 @@
 import fs from "node:fs";
 import { config } from "../config";
-import { CatalogTask, TaskCatalog, TaskStep, TaskType } from "../models/session";
+import { CatalogTask, RawCatalogTask, TaskCatalog, TaskStep, TaskType } from "../models/session";
+
+const DEFAULT_TASK_LOCATION = "Unbekannter Ort";
 
 export function loadTaskCatalog(): TaskCatalog {
   const raw = fs.readFileSync(config.tasksPath, "utf8");
@@ -35,24 +37,28 @@ function pickMany<T>(source: T[], amount: number): T[] {
   return result;
 }
 
-function normalizeCatalogTask(task: string | Omit<CatalogTask, "category">, category: TaskType, index: number): CatalogTask {
+function normalizeCatalogTask(task: string | RawCatalogTask, category: TaskType, index: number): CatalogTask {
   if (typeof task === "string") {
     return {
       id: `${category}_${index + 1}`,
       title: task,
       description: task,
+      location: DEFAULT_TASK_LOCATION,
       category
     };
   }
 
-  if (!task.id || !task.title) {
+  const title = task.title ?? task.name;
+  if (!task.id || !title) {
     throw new Error(`Task catalog ${config.tasksPath} has a ${category} task without id or title`);
   }
 
   const steps = normalizeSteps(task.steps ?? [], task.id);
   return {
-    ...task,
-    description: task.description ?? task.title,
+    id: task.id,
+    title,
+    description: task.description ?? task.beschreibung ?? title,
+    location: task.ort ?? task.location ?? DEFAULT_TASK_LOCATION,
     category,
     steps
   };

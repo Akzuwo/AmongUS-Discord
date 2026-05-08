@@ -166,7 +166,7 @@ function mapTask(row: any): PlayerTask {
     taskId: row.task_id,
     title: row.title || row.description,
     description: row.description,
-    location: row.location,
+    location: row.location || "Unbekannter Ort",
     completed: row.completed === 1,
     completedAt: row.completed_at,
     steps: []
@@ -413,6 +413,29 @@ export async function setPlayerChannel(sessionId: number, userId: string, channe
   await db.run("UPDATE players SET channel_id = ? WHERE session_id = ? AND user_id = ?", channelId, sessionId, userId);
 }
 
+export async function addSessionChannel(sessionId: number, channelId: string, purpose: string, isTemporary = true): Promise<void> {
+  const db = await getDb();
+  await db.run(
+    `INSERT INTO session_channels (session_id, channel_id, purpose, is_temporary)
+     VALUES (?, ?, ?, ?)
+     ON CONFLICT(session_id, channel_id)
+     DO UPDATE SET purpose = excluded.purpose, is_temporary = excluded.is_temporary`,
+    sessionId,
+    channelId,
+    purpose,
+    isTemporary ? 1 : 0
+  );
+}
+
+export async function getTemporarySessionChannelIds(sessionId: number): Promise<string[]> {
+  const db = await getDb();
+  const rows = await db.all(
+    "SELECT channel_id FROM session_channels WHERE session_id = ? AND is_temporary = 1 ORDER BY created_at ASC",
+    sessionId
+  );
+  return rows.map((row: any) => row.channel_id);
+}
+
 export async function setPlayerState(sessionId: number, userId: string, state: PlayerState): Promise<void> {
   const db = await getDb();
   await db.run(
@@ -494,7 +517,7 @@ export async function addTask(sessionId: number, userId: string, task: CatalogTa
     task.id,
     task.title,
     task.description,
-    task.location ?? null
+    task.location || "Unbekannter Ort"
   );
   const assignedTaskId = result.lastID as number;
   for (const step of task.steps ?? []) {
@@ -671,6 +694,45 @@ export async function getCrazyPostTexts(sessionId: number): Promise<CrazyPostTex
 export async function getNextCrazyPostTextForPlayer(sessionId: number, userId: string): Promise<CrazyPostText | null> {
   const texts = await getCrazyPostTexts(sessionId);
   return texts.find((text) => !text.finished && text.route[text.currentStepIndex] === userId) ?? null;
+}
+
+export async function enqueueCrazyPostPendingPrompt(sessionId: number, userId: string, textId: number): Promise<void> {
+  const db = await getDb();
+  await db.run(
+    "INSERT OR IGNORE INTO crazy_post_pending_prompts (session_id, user_id, text_id) VALUES (?, ?, ?)",
+    sessionId,
+    userId,
+    textId
+  );
+}
+
+export async function dequeueCrazyPostPendingPrompt(sessionId: number, userId: string): Promise<number | null> {
+  const db = await getDb();
+  const row = await db.get(
+    "SELECT text_id FROM crazy_post_pending_prompts WHERE session_id = ? AND user_id = ? ORDER BY queued_at ASC, text_id ASC LIMIT 1",
+    sessionId,
+    userId
+  );
+  if (!row) {
+    return null;
+  }
+  await db.run(
+    "DELETE FROM crazy_post_pending_prompts WHERE session_id = ? AND user_id = ? AND text_id = ?",
+    sessionId,
+    userId,
+    row.text_id
+  );
+  return row.text_id;
+}
+
+export async function getCrazyPostPendingPromptIds(sessionId: number, userId: string): Promise<number[]> {
+  const db = await getDb();
+  const rows = await db.all(
+    "SELECT text_id FROM crazy_post_pending_prompts WHERE session_id = ? AND user_id = ? ORDER BY queued_at ASC, text_id ASC",
+    sessionId,
+    userId
+  );
+  return rows.map((row: any) => row.text_id);
 }
 
 export async function addCrazyPostSentence(textId: number, authorId: string, content: string): Promise<void> {

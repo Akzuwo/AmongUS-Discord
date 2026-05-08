@@ -4,22 +4,39 @@
       "id": "short_001",
       "title": "Sicherungskasten pruefen",
       "description": "Gehe zum Sicherungskasten und pruefe ihn.",
-      "location": "Gang"
+      "ort": "Gang"
     },
     {
       "id": "short_002",
       "title": "Objekt finden",
-      "description": "Finde ein bestimmtes Objekt in deiner Umgebung."
+      "description": "Finde ein bestimmtes Objekt in deiner Umgebung.",
+      "ort": "Unbekannter Ort"
     },
-    "Zaehle etwas in deiner Umgebung.",
-    "Merke dir ein Codewort."
+    {
+      "id": "short_003",
+      "title": "Zaehle etwas in deiner Umgebung",
+      "description": "Zaehle etwas in deiner Umgebung.",
+      "ort": "Unbekannter Ort"
+    },
+    {
+      "id": "short_004",
+      "title": "Codewort merken",
+      "description": "Merke dir ein Codewort.",
+      "ort": "Unbekannter Ort"
+    }
   ],
   "medium_tasks": [
-    "Loese ein kleines Raetsel.",
+    {
+      "id": "medium_000",
+      "title": "Kleines Raetsel loesen",
+      "description": "Loese ein kleines Raetsel.",
+      "ort": "Unbekannter Ort"
+    },
     {
       "id": "medium_001",
       "title": "Stationen ablaufen",
       "description": "Finde mehrere Stationen und bestaetige sie nacheinander.",
+      "ort": "Unbekannter Ort",
       "steps": [
         {
           "id": "station_a",
@@ -31,15 +48,25 @@
         }
       ]
     },
-    "Hole eine Information von einem Ort.",
-    "Kombiniere zwei Hinweise."
+    {
+      "id": "medium_002",
+      "title": "Information holen",
+      "description": "Hole eine Information von einem Ort.",
+      "ort": "Unbekannter Ort"
+    },
+    {
+      "id": "medium_003",
+      "title": "Hinweise kombinieren",
+      "description": "Kombiniere zwei Hinweise.",
+      "ort": "Unbekannter Ort"
+    }
   ],
   "long_tasks": [
     {
       "id": "long_001",
       "title": "Reaktor kalibrieren",
       "description": "Fuehre alle Kalibrierungsschritte aus.",
-      "location": "Technikraum",
+      "ort": "Technikraum",
       "steps": [
         {
           "id": "step_1",
@@ -58,8 +85,23 @@
         }
       ]
     },
-    "Suche mehrere Orte auf.",
-    "Erfuelle eine kleine Challenge.",
-    "Sammle mehrere Informationen."
+    {
+      "id": "long_002",
+      "title": "Mehrere Orte aufsuchen",
+      "description": "Suche mehrere Orte auf.",
+      "ort": "Unbekannter Ort"
+    },
+    {
+      "id": "long_003",
+      "title": "Kleine Challenge erfuellen",
+      "description": "Erfuelle eine kleine Challenge.",
+      "ort": "Unbekannter Ort"
+    },
+    {
+      "id": "long_004",
+      "title": "Informationen sammeln",
+      "description": "Sammle mehrere Informationen.",
+      "ort": "Unbekannter Ort"
+    }
   ]
 }

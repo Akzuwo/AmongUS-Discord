@@ -86,15 +86,21 @@ export interface CatalogTask {
   id: string;
   title: string;
   description: string;
-  location?: string;
+  location: string;
   category: TaskType;
   steps?: TaskStep[];
 }
 
+export type RawCatalogTask = Omit<Partial<CatalogTask>, "category"> & {
+  name?: string;
+  beschreibung?: string;
+  ort?: string;
+};
+
 export interface TaskCatalog {
-  short_tasks: Array<string | Omit<CatalogTask, "category">>;
-  medium_tasks: Array<string | Omit<CatalogTask, "category">>;
-  long_tasks: Array<string | Omit<CatalogTask, "category">>;
+  short_tasks: Array<string | RawCatalogTask>;
+  medium_tasks: Array<string | RawCatalogTask>;
+  long_tasks: Array<string | RawCatalogTask>;
 }
 
 export interface Vote {

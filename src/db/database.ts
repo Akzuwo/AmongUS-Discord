@@ -171,6 +171,26 @@ export async function initDb(): Promise<void> {
       FOREIGN KEY(active_text_id) REFERENCES crazy_post_texts(id) ON DELETE SET NULL
     );
 
+    CREATE TABLE IF NOT EXISTS crazy_post_pending_prompts (
+      session_id INTEGER NOT NULL,
+      user_id TEXT NOT NULL,
+      text_id INTEGER NOT NULL,
+      queued_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      PRIMARY KEY(session_id, user_id, text_id),
+      FOREIGN KEY(session_id) REFERENCES sessions(id) ON DELETE CASCADE,
+      FOREIGN KEY(text_id) REFERENCES crazy_post_texts(id) ON DELETE CASCADE
+    );
+
+    CREATE TABLE IF NOT EXISTS session_channels (
+      session_id INTEGER NOT NULL,
+      channel_id TEXT NOT NULL,
+      purpose TEXT NOT NULL,
+      is_temporary INTEGER NOT NULL DEFAULT 1,
+      created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      PRIMARY KEY(session_id, channel_id),
+      FOREIGN KEY(session_id) REFERENCES sessions(id) ON DELETE CASCADE
+    );
+
     CREATE TABLE IF NOT EXISTS fragwuerdig_settings (
       session_id INTEGER PRIMARY KEY,
       impostor_count INTEGER NOT NULL,

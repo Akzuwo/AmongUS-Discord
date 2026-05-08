@@ -16,12 +16,16 @@ import {
   addCrazyPostSentence,
   addCrazyPostText,
   addPlayer,
+  addSessionChannel,
   advanceCrazyPostText,
   createCrazyPostSession,
+  dequeueCrazyPostPendingPrompt,
   ensureCrazyPostPlayerState,
+  enqueueCrazyPostPendingPrompt,
   getAnyActiveSession,
   getActiveCrazyPostSessionByChannel,
   getCrazyPostPlayerState,
+  getCrazyPostPendingPromptIds,
   getCrazyPostSentences,
   getCrazyPostTextById,
   getCrazyPostTexts,
@@ -29,6 +33,7 @@ import {
   getPlayer,
   getPlayers,
   getSessionById,
+  getTemporarySessionChannelIds,
   setCrazyPostPlayerState,
   setPlayerChannel,
   setSessionStatus,
@@ -36,9 +41,12 @@ import {
 } from "../db/repository";
 import { CrazyPostOrderMode, GameSession, Player } from "../models/session";
 import { ids } from "../utils/customIds";
+import { logger } from "../utils/logger";
 
 const WAITING_TEXT =
   "Aktuell gibt es keinen Text fuer dich zum Weiterschreiben. Du bekommst automatisch eine neue Aufgabe, sobald ein Text verfuegbar ist.";
+const TEXT_COLLECTION_CHANNEL_NAME = "text-sammlung";
+const crazyPostLogger = logger.scoped("CrazyPost");
 
 export async function createCrazyPostGameSession(
   guild: Guild,
@@ -51,13 +59,12 @@ export async function createCrazyPostGameSession(
   }
 
   const category = await getOrCreateMinigamesCategory(guild);
-  const signup = await getOrCreateSignupChannel(guild, category.id, "verrueckte-post-anmeldung", creator.id);
+  const { channel: signup, created: signupCreated } = await getOrCreateSignupChannel(guild, category.id, "verrueckte-post-anmeldung", creator.id);
   const admin = await getOrCreateAdminChannel(guild, category.id, "verrueckte-post-admin", creator.id);
 
   await Promise.all([
     clearBotMessages(signup),
-    clearBotMessages(admin),
-    clearStaleCrazyPostPlayerChannels(guild, category.id)
+    clearBotMessages(admin)
   ]);
 
   const session = await createCrazyPostSession(guild.id, creator.id, orderMode);
@@ -65,6 +72,9 @@ export async function createCrazyPostGameSession(
     embeds: [crazyPostLobbyEmbed(session, [])],
     components: [new ActionRowBuilder<ButtonBuilder>().addComponents(joinButton(session), startButton(session), cancelButton(session))]
   });
+  if (signupCreated) {
+    await addSessionChannel(session.id, signup.id, "crazy_post_signup", true);
+  }
 
   await updateSessionChannels(session.id, {
     categoryId: category.id,
@@ -110,22 +120,25 @@ export async function startCrazyPostGame(guild: Guild, sessionId: number, userId
     const member = await guild.members.fetch(player.userId);
     const channel = await createPrivateCrazyPostChannel(guild, session.categoryId, player, member);
     await setPlayerChannel(session.id, player.userId, channel.id);
+    await addSessionChannel(session.id, channel.id, `crazy_post_player:${player.userId}`, true);
     await ensureCrazyPostPlayerState(session.id, player.userId);
   }
 
+  const createdTexts = [];
   for (let index = 0; index < players.length; index += 1) {
     const origin = players[index];
     const route = session.orderMode === "random"
       ? [origin.userId, ...shuffle(players.filter((player) => player.userId !== origin.userId).map((player) => player.userId))]
       : [...players.slice(index), ...players.slice(0, index)].map((player) => player.userId);
-    await addCrazyPostText(session.id, origin.userId, route);
+    createdTexts.push(await addCrazyPostText(session.id, origin.userId, route));
   }
+  await logCrazyPostRoundStart(guild, session.id, createdTexts.map((text) => text.id));
 
   await setSessionStatus(session.id, "playing");
   await refreshCrazyPostLobby(guild, session.id);
 
   for (const player of await getPlayers(session.id)) {
-    await showNextCrazyPostTask(guild, session.id, player.userId);
+    await showNextAvailableCrazyPostTask(guild, session.id, player.userId);
   }
 }
 
@@ -158,7 +171,9 @@ export async function handleCrazyPostPlayerMessage(message: Message): Promise<bo
 
   const text = await getCrazyPostTextById(state.activeTextId);
   if (!text || text.finished || text.route[text.currentStepIndex] !== player.userId) {
-    await showNextCrazyPostTask(message.guild, session.id, player.userId);
+    await deleteActiveMessage(message.guild, player, state.activeMessageId);
+    await setCrazyPostPlayerState(session.id, player.userId, { activeMessageId: null, activeTextId: null });
+    await releaseNextCrazyPostTask(message.guild, session.id, player.userId);
     return true;
   }
 
@@ -169,13 +184,14 @@ export async function handleCrazyPostPlayerMessage(message: Message): Promise<bo
   await addCrazyPostSentence(text.id, player.userId, content);
   const nextStepIndex = text.currentStepIndex + 1;
   const finished = nextStepIndex >= text.route.length;
+  await logCrazyPostSubmission(message.guild, session, text.id, player, text.currentStepIndex, finished, content);
   await advanceCrazyPostText(text.id, nextStepIndex, finished);
 
   if (!finished) {
-    await showNextCrazyPostTask(message.guild, session.id, text.route[nextStepIndex]);
+    await queueOrSendCrazyPostTask(message.guild, session.id, text.route[nextStepIndex], text.id);
   }
 
-  await showNextCrazyPostTask(message.guild, session.id, player.userId);
+  await releaseNextCrazyPostTask(message.guild, session.id, player.userId);
   await finishCrazyPostIfComplete(message.guild, session.id);
   return true;
 }
@@ -208,7 +224,30 @@ export async function refreshCrazyPostLobby(guild: Guild, sessionId: number): Pr
   });
 }
 
-async function showNextCrazyPostTask(guild: Guild, sessionId: number, userId: string): Promise<void> {
+async function showNextAvailableCrazyPostTask(guild: Guild, sessionId: number, userId: string): Promise<void> {
+  const state = await getCrazyPostPlayerState(sessionId, userId);
+  if (state?.activeTextId) {
+    crazyPostLogger.debug("Neue Aufgabe nicht zugestellt: Spieler hat bereits aktive Eingabe.", {
+      sessionId,
+      userId,
+      activeTextId: state.activeTextId
+    });
+    return;
+  }
+
+  const pendingTextId = await dequeueCrazyPostPendingPrompt(sessionId, userId);
+  if (pendingTextId) {
+    crazyPostLogger.debug("Wartender Text wird nach Absenden freigegeben.", { sessionId, userId, textId: pendingTextId });
+    await sendCrazyPostTask(guild, sessionId, userId, pendingTextId, "pending");
+    return;
+  }
+
+  const text = await getNextCrazyPostTextForPlayer(sessionId, userId);
+  if (text) {
+    await sendCrazyPostTask(guild, sessionId, userId, text.id, "direct");
+    return;
+  }
+
   const player = await getPlayer(sessionId, userId);
   if (!player) {
     return;
@@ -218,16 +257,62 @@ async function showNextCrazyPostTask(guild: Guild, sessionId: number, userId: st
     return;
   }
 
-  const state = await getCrazyPostPlayerState(sessionId, userId);
   await deleteActiveMessage(guild, player, state?.activeMessageId ?? null);
+  const waiting = await channel.send(WAITING_TEXT);
+  await setCrazyPostPlayerState(sessionId, userId, { activeMessageId: waiting.id, activeTextId: null });
+}
 
-  const text = await getNextCrazyPostTextForPlayer(sessionId, userId);
-  if (!text) {
-    const waiting = await channel.send(WAITING_TEXT);
-    await setCrazyPostPlayerState(sessionId, userId, { activeMessageId: waiting.id, activeTextId: null });
+async function queueOrSendCrazyPostTask(guild: Guild, sessionId: number, userId: string, textId: number): Promise<void> {
+  const state = await getCrazyPostPlayerState(sessionId, userId);
+  if (state?.activeTextId) {
+    await enqueueCrazyPostPendingPrompt(sessionId, userId, textId);
+    crazyPostLogger.debug("Text wegen aktiver Eingabe zurueckgehalten.", {
+      sessionId,
+      userId,
+      textId,
+      activeTextId: state.activeTextId,
+      pendingTextIds: await getCrazyPostPendingPromptIds(sessionId, userId)
+    });
     return;
   }
+  await sendCrazyPostTask(guild, sessionId, userId, textId, "direct");
+}
 
+async function releaseNextCrazyPostTask(guild: Guild, sessionId: number, userId: string): Promise<void> {
+  const pendingTextId = await dequeueCrazyPostPendingPrompt(sessionId, userId);
+  if (pendingTextId) {
+    crazyPostLogger.debug("Wartender Text wird nach Absenden freigegeben.", { sessionId, userId, textId: pendingTextId });
+    await sendCrazyPostTask(guild, sessionId, userId, pendingTextId, "pending");
+    return;
+  }
+  await showNextAvailableCrazyPostTask(guild, sessionId, userId);
+}
+
+async function sendCrazyPostTask(guild: Guild, sessionId: number, userId: string, textId: number, source: "direct" | "pending"): Promise<void> {
+  const player = await getPlayer(sessionId, userId);
+  if (!player) {
+    return;
+  }
+  const channel = await getTextChannel(guild, player.channelId);
+  if (!channel) {
+    return;
+  }
+  const state = await getCrazyPostPlayerState(sessionId, userId);
+  if (state?.activeTextId) {
+    await enqueueCrazyPostPendingPrompt(sessionId, userId, textId);
+    crazyPostLogger.debug("Text beim Senden zurueckgehalten, weil aktive Eingabe existiert.", {
+      sessionId,
+      userId,
+      textId,
+      activeTextId: state.activeTextId
+    });
+    return;
+  }
+  const text = await getCrazyPostTextById(textId);
+  if (!text || text.finished || text.route[text.currentStepIndex] !== userId) {
+    return;
+  }
+  await deleteActiveMessage(guild, player, state?.activeMessageId ?? null);
   const sentences = await getCrazyPostSentences(text.id);
   const lastSentence = sentences.at(-1)?.content;
   const content = lastSentence
@@ -235,6 +320,13 @@ async function showNextCrazyPostTask(guild: Guild, sessionId: number, userId: st
     : "**Starte deinen eigenen Text mit genau einem ersten Satz.**";
   const taskMessage = await channel.send(content);
   await setCrazyPostPlayerState(sessionId, userId, { activeMessageId: taskMessage.id, activeTextId: text.id });
+  crazyPostLogger.debug(source === "pending" ? "Wartender Text zugestellt." : "Text direkt zugestellt.", {
+    sessionId,
+    userId,
+    textId: text.id,
+    stepIndex: text.currentStepIndex,
+    source
+  });
 }
 
 async function finishCrazyPostIfComplete(guild: Guild, sessionId: number): Promise<void> {
@@ -257,6 +349,8 @@ async function finishCrazyPostIfComplete(guild: Guild, sessionId: number): Promi
   for (const text of texts) {
     await sendFinishedTextToOrigin(guild, sessionId, text.id);
   }
+  await sendFinishedTextsToCollection(guild, sessionId, texts.map((text) => text.id));
+  await logCrazyPostFinalTexts(guild, sessionId, texts.map((text) => text.id));
   const signup = await getTextChannel(guild, session.lobbyChannelId);
   const admin = await getTextChannel(guild, session.adminChannelId);
   const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
@@ -280,25 +374,129 @@ async function sendFinishedTextToOrigin(guild: Guild, sessionId: number, textId:
     return;
   }
   const sentences = await getCrazyPostSentences(textId);
-  await channel.send([
+  await sendLongText(channel, [
     "Verrueckte Post ist fertig! Hier ist dein vollstaendiger Text. Lies ihn jetzt im Voicechat vor.",
     "",
     ...sentences.map((sentence, index) => `${index + 1}. ${sentence.content}`)
   ].join("\n"));
 }
 
+async function logCrazyPostRoundStart(guild: Guild, sessionId: number, textIds: number[]): Promise<void> {
+  const session = await requireCrazyPostSession(sessionId);
+  const admin = await getTextChannel(guild, session.adminChannelId);
+  if (!admin) {
+    return;
+  }
+  const players = await getPlayers(sessionId);
+  const lines = [
+    `## Verrueckte-Post-Protokoll - Runde ${sessionId}`,
+    "",
+    `Session: ${sessionId}`,
+    `Reihenfolge-Modus: ${formatOrderMode(session.orderMode)}`,
+    `Spieler: ${players.map(formatPlayerForAdmin).join(", ")}`,
+    "",
+    "Textrouten:"
+  ];
+  for (let index = 0; index < textIds.length; index += 1) {
+    const text = await getCrazyPostTextById(textIds[index]);
+    if (!text) {
+      continue;
+    }
+    lines.push(`Text ${index + 1} (ID ${text.id}, Startautor ${formatPlayerIdForAdmin(players, text.originUserId)}):`);
+    lines.push(text.route.map((userId, routeIndex) => `${routeIndex + 1}. ${formatPlayerIdForAdmin(players, userId)}`).join(" -> "));
+  }
+  await sendLongText(admin, lines.join("\n"));
+}
+
+async function logCrazyPostSubmission(
+  guild: Guild,
+  session: GameSession,
+  textId: number,
+  player: Player,
+  stepIndex: number,
+  finished: boolean,
+  content: string
+): Promise<void> {
+  const admin = await getTextChannel(guild, session.adminChannelId);
+  if (!admin) {
+    return;
+  }
+  const text = await getCrazyPostTextById(textId);
+  const submissionType = stepIndex === 0 ? "Starttext" : finished ? "Endversion" : "Weiterfuehrung";
+  const order = `${stepIndex + 1}/${text?.route.length ?? "?"}`;
+  await sendLongText(admin, [
+    `## Texteinsendung - Verrueckte Post Runde ${session.id}`,
+    "",
+    `Session: ${session.id}`,
+    `Text: ID ${textId}`,
+    `Reihenfolge innerhalb der Runde: ${order}`,
+    `Typ: ${submissionType}`,
+    `Spieler: ${formatPlayerForAdmin(player)}`,
+    `Discord-User: <@${player.userId}> (${player.userId})`,
+    "",
+    "Eingereichter Text:",
+    content
+  ].join("\n"));
+}
+
+async function sendFinishedTextsToCollection(guild: Guild, sessionId: number, textIds: number[]): Promise<void> {
+  const channel = await findTextChannelByName(guild, TEXT_COLLECTION_CHANNEL_NAME);
+  if (!channel) {
+    const session = await requireCrazyPostSession(sessionId);
+    const admin = await getTextChannel(guild, session.adminChannelId);
+    await admin?.send(`Channel #${TEXT_COLLECTION_CHANNEL_NAME} wurde nicht gefunden. Fertige Texte konnten dort nicht gesammelt werden.`).catch(() => null);
+    return;
+  }
+  const lines = [`## Verrueckte Post - Runde ${sessionId}`, ""];
+  for (let index = 0; index < textIds.length; index += 1) {
+    const sentences = await getCrazyPostSentences(textIds[index]);
+    lines.push(`### Text ${index + 1}`);
+    lines.push(formatFinishedText(sentences));
+    lines.push("");
+  }
+  await sendLongText(channel, lines.join("\n").trimEnd());
+}
+
+async function logCrazyPostFinalTexts(guild: Guild, sessionId: number, textIds: number[]): Promise<void> {
+  const session = await requireCrazyPostSession(sessionId);
+  const admin = await getTextChannel(guild, session.adminChannelId);
+  if (!admin) {
+    return;
+  }
+  const players = await getPlayers(sessionId);
+  const lines = [`## Vollstaendige Endtexte - Verrueckte Post Runde ${sessionId}`, ""];
+  for (let index = 0; index < textIds.length; index += 1) {
+    const text = await getCrazyPostTextById(textIds[index]);
+    const sentences = await getCrazyPostSentences(textIds[index]);
+    lines.push(`### Text ${index + 1} (ID ${textIds[index]})`);
+    if (text) {
+      lines.push(`Startautor: ${formatPlayerIdForAdmin(players, text.originUserId)}`);
+      lines.push(`Route: ${text.route.map((userId, routeIndex) => `${routeIndex + 1}. ${formatPlayerIdForAdmin(players, userId)}`).join(" -> ")}`);
+    }
+    lines.push("Endtext:");
+    lines.push(formatFinishedText(sentences));
+    lines.push("");
+  }
+  await sendLongText(admin, lines.join("\n").trimEnd());
+}
+
 async function deleteCrazyPostChannels(guild: Guild, sessionId: number): Promise<string> {
   const session = await requireCrazyPostSession(sessionId);
-  const idsToDelete = [
-    session.lobbyChannelId,
-    session.adminChannelId,
-    ...(await getPlayers(session.id)).map((player) => player.channelId)
-  ].filter(Boolean) as string[];
+  const protectedIds = new Set(
+    [
+      session.adminChannelId,
+      await findTextChannelIdByName(guild, TEXT_COLLECTION_CHANNEL_NAME)
+    ].filter(Boolean) as string[]
+  );
+  const temporaryChannelIds = new Set(await getTemporarySessionChannelIds(session.id));
 
   const failed: string[] = [];
-  for (const channelId of idsToDelete) {
+  for (const channelId of temporaryChannelIds) {
+    if (protectedIds.has(channelId)) {
+      continue;
+    }
     const channel = await guild.channels.fetch(channelId).catch(() => null);
-    if (!channel) {
+    if (!channel || !temporaryChannelIds.has(channel.id) || channel.id !== channelId || protectedIds.has(channel.id)) {
       continue;
     }
     const deleted = await channel.delete("Verrueckte-Post-Session aufgeraeumt").then(() => true).catch((error) => {
@@ -312,7 +510,7 @@ async function deleteCrazyPostChannels(guild: Guild, sessionId: number): Promise
 
   return failed.length
     ? `Einige Session-Kanaele konnten nicht geloescht werden: ${failed.map((id) => `<#${id}>`).join(", ")}`
-    : "Session aufgeraeumt. Alle Verrueckte-Post-Kanaele wurden geloescht.";
+    : "Session aufgeraeumt. Alle temporaeren Verrueckte-Post-Kanaele wurden geloescht.";
 }
 
 async function deleteActiveMessage(guild: Guild, player: Player, messageId: string | null): Promise<void> {
@@ -335,27 +533,29 @@ async function getOrCreateMinigamesCategory(guild: Guild): Promise<GuildBasedCha
   return guild.channels.create({ name: "Minigames", type: ChannelType.GuildCategory });
 }
 
-async function getOrCreateTextChannel(guild: Guild, parent: string, name: string): Promise<TextChannel> {
+async function getOrCreateTextChannel(guild: Guild, parent: string, name: string): Promise<{ channel: TextChannel; created: boolean }> {
   const existing = guild.channels.cache.find((channel) => channel.type === ChannelType.GuildText && channel.name === name);
   if (existing?.type === ChannelType.GuildText) {
     if (existing.parentId !== parent) {
       await existing.setParent(parent).catch((error) => console.error(`Could not move ${name}`, error));
     }
-    return existing as TextChannel;
+    return { channel: existing as TextChannel, created: false };
   }
-  return guild.channels.create({ name, type: ChannelType.GuildText, parent }) as Promise<TextChannel>;
+  const channel = await guild.channels.create({ name, type: ChannelType.GuildText, parent });
+  return { channel: channel as TextChannel, created: true };
 }
 
-async function getOrCreateSignupChannel(guild: Guild, parent: string, name: string, creatorId: string): Promise<TextChannel> {
-  const channel = await getOrCreateTextChannel(guild, parent, name);
+async function getOrCreateSignupChannel(guild: Guild, parent: string, name: string, creatorId: string): Promise<{ channel: TextChannel; created: boolean }> {
+  const result = await getOrCreateTextChannel(guild, parent, name);
+  const channel = result.channel;
   await channel.permissionOverwrites.set(signupPermissionOverwrites(guild, creatorId)).catch((error) => {
     console.error("Crazy Post signup channel permissions could not be updated", error);
   });
-  return channel;
+  return result;
 }
 
 async function getOrCreateAdminChannel(guild: Guild, parent: string, name: string, creatorId: string): Promise<TextChannel> {
-  const channel = await getOrCreateTextChannel(guild, parent, name);
+  const { channel } = await getOrCreateTextChannel(guild, parent, name);
   await channel.permissionOverwrites.set(adminPermissionOverwrites(guild, creatorId)).catch((error) => {
     console.error("Crazy Post admin channel permissions could not be updated", error);
   });
@@ -385,17 +585,6 @@ async function createPrivateCrazyPostChannel(guild: Guild, parent: string, playe
     permissionOverwrites: overwrites
   });
   return channel as TextChannel;
-}
-
-async function clearStaleCrazyPostPlayerChannels(guild: Guild, categoryId: string): Promise<void> {
-  const staleChannels = guild.channels.cache.filter(
-    (channel) => channel.type === ChannelType.GuildText && channel.parentId === categoryId && channel.name.startsWith("post-")
-  );
-  for (const channel of staleChannels.values()) {
-    await channel.delete("Alten Verrueckte-Post-Spielerkanal vor neuer Session entfernt").catch((error) => {
-      console.error(`Stale Crazy Post channel ${channel.id} could not be deleted`, error);
-    });
-  }
 }
 
 async function clearBotMessages(channel: TextChannel): Promise<void> {
@@ -449,7 +638,49 @@ function cancelButton(session: GameSession): ButtonBuilder {
 }
 
 function normalizeSentence(value: string): string {
-  return value.replace(/\s+/g, " ").trim().slice(0, 1000);
+  return value.trim();
+}
+
+function formatFinishedText(sentences: Awaited<ReturnType<typeof getCrazyPostSentences>>): string {
+  return sentences.map((sentence) => sentence.content).join("\n");
+}
+
+function formatPlayerForAdmin(player: Player): string {
+  return `${player.username} / <@${player.userId}> (${player.userId})`;
+}
+
+function formatPlayerIdForAdmin(players: Player[], userId: string): string {
+  const player = players.find((candidate) => candidate.userId === userId);
+  return player ? formatPlayerForAdmin(player) : `<@${userId}> (${userId})`;
+}
+
+async function sendLongText(channel: TextChannel, content: string): Promise<void> {
+  const maxLength = 1900;
+  let remaining = content;
+  while (remaining.length > maxLength) {
+    let splitAt = remaining.lastIndexOf("\n", maxLength);
+    if (splitAt < 1) {
+      splitAt = maxLength;
+    }
+    const chunk = remaining.slice(0, splitAt).trimEnd();
+    if (chunk) {
+      await channel.send(chunk);
+    }
+    remaining = remaining.slice(splitAt).trimStart();
+  }
+  if (remaining.length > 0) {
+    await channel.send(remaining);
+  }
+}
+
+async function findTextChannelByName(guild: Guild, name: string): Promise<TextChannel | null> {
+  await guild.channels.fetch().catch(() => null);
+  const channel = guild.channels.cache.find((candidate) => candidate.type === ChannelType.GuildText && candidate.name === name);
+  return channel?.type === ChannelType.GuildText ? (channel as TextChannel) : null;
+}
+
+async function findTextChannelIdByName(guild: Guild, name: string): Promise<string | null> {
+  return (await findTextChannelByName(guild, name))?.id ?? null;
 }
 
 function formatOrderMode(orderMode: CrazyPostOrderMode | null): string {

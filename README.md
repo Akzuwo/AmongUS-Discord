@@ -227,7 +227,7 @@ Einfache Task:
   "id": "short_001",
   "title": "Sicherungskasten pruefen",
   "description": "Gehe zum Sicherungskasten und pruefe ihn.",
-  "location": "Gang"
+  "ort": "Gang"
 }
 ```
 
@@ -238,7 +238,7 @@ Multi-Step-Task:
   "id": "long_001",
   "title": "Reaktor kalibrieren",
   "description": "Fuehre alle Kalibrierungsschritte aus.",
-  "location": "Technikraum",
+  "ort": "Technikraum",
   "steps": [
     {
       "id": "step_1",
@@ -255,6 +255,8 @@ Multi-Step-Task:
 Wichtig:
 
 - `steps` ist optional.
+- `ort` ist optional; wenn es fehlt, nutzt der Bot `Unbekannter Ort`.
+- Alte Tasks mit `location` funktionieren weiterhin.
 - Ohne `steps` ist es eine normale Task.
 - Multi-Step-Tasks zaehlen erst als erledigt, wenn alle Steps erledigt sind.
 - Impostor-Fake-Tasks zaehlen nicht zum Crewmate-Fortschritt.

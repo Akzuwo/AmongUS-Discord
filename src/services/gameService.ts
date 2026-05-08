@@ -1107,7 +1107,7 @@ async function sendVotingMessage(guild: Guild, sessionId: number, startedAt: num
 
 async function sendPlayerStartMessage(channel: TextChannel, player: Player, tasks: PlayerTask[]): Promise<void> {
   await channel.send(
-    `Deine Rolle: **${player.role}**\nDeine Tasks:\n${tasks.map((task, index) => `${index + 1}. [${task.taskType}] ${task.title}`).join("\n")}`
+    `Deine Rolle: **${player.role}**\nDeine Tasks:\n${tasks.map((task, index) => `${index + 1}. [${task.taskType}] ${task.title} - Ort: ${taskLocation(task)}`).join("\n")}`
   );
 
   for (const task of tasks) {
@@ -1157,7 +1157,7 @@ function singleStepTaskContent(task: PlayerTask): string {
   return [
     `${taskTypeLabel(task.taskType)}: ${task.title}`,
     task.description !== task.title ? task.description : "",
-    task.location ? `Ort: ${task.location}` : "",
+    `Ort: ${taskLocation(task)}`,
     task.completed ? "Status: erledigt" : ""
   ].filter(Boolean).join("\n");
 }
@@ -1167,13 +1167,17 @@ function multiStepTaskContent(task: PlayerTask): string {
   return [
     `${taskTypeLabel(task.taskType)}: ${task.title}`,
     task.description,
-    task.location ? `Ort: ${task.location}` : "",
+    `Ort: ${taskLocation(task)}`,
     "",
     "Steps:",
     ...task.steps.map((step) => `${step.completed ? "[x]" : "[ ]"} ${step.title}${step.description ? ` - ${step.description}` : ""}`),
     "",
     `Fortschritt: ${done}/${task.steps.length} Steps`
   ].filter((line, index, lines) => line !== "" || lines[index - 1] !== "").join("\n");
+}
+
+function taskLocation(task: PlayerTask): string {
+  return task.location?.trim() || "Unbekannter Ort";
 }
 
 function taskTypeLabel(taskType: PlayerTask["taskType"]): string {
