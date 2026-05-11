@@ -90,6 +90,18 @@ export const crazyPostCommand = new SlashCommandBuilder()
         { name: "statisch", value: "static" },
         { name: "zufaellig", value: "random" }
       )
+  )
+  .addBooleanOption((option) =>
+    option
+      .setName("debug")
+      .setDescription("Debugrunde fuer Verrueckte Post erstellen")
+  )
+  .addIntegerOption((option) =>
+    option
+      .setName("ghost_count")
+      .setDescription("Anzahl Ghost-Spieler fuer eine Debugrunde")
+      .setMinValue(1)
+      .setMaxValue(config.debugMaxGhostPlayers)
   );
 
 export const gameCommand = new SlashCommandBuilder()

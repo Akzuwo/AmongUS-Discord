@@ -83,7 +83,9 @@ function mapCrazyPostPlayerState(row: any): CrazyPostPlayerState {
     sessionId: row.session_id,
     userId: row.user_id,
     activeMessageId: row.active_message_id,
-    activeTextId: row.active_text_id
+    activeTextId: row.active_text_id,
+    queueMessageId: row.queue_message_id,
+    queueWarningActive: row.queue_warning_active === 1
   };
 }
 
@@ -212,14 +214,21 @@ export async function createSession(
   return getSessionById(result.lastID as number) as Promise<GameSession>;
 }
 
-export async function createCrazyPostSession(guildId: string, createdBy: string, orderMode: CrazyPostOrderMode): Promise<GameSession> {
+export async function createCrazyPostSession(
+  guildId: string,
+  createdBy: string,
+  orderMode: CrazyPostOrderMode,
+  options: { isDebugSession?: boolean; ghostCount?: number } = {}
+): Promise<GameSession> {
   const db = await getDb();
   const result = await db.run(
-    `INSERT INTO sessions (guild_id, game_type, status, order_mode, created_by, emergency_user_id, short_tasks, medium_tasks, long_tasks)
-     VALUES (?, 'crazy_post', 'lobby', ?, ?, '', 0, 0, 0)`,
+    `INSERT INTO sessions (guild_id, game_type, status, order_mode, created_by, emergency_user_id, short_tasks, medium_tasks, long_tasks, is_debug_session, ghost_count)
+     VALUES (?, 'crazy_post', 'lobby', ?, ?, '', 0, 0, 0, ?, ?)`,
     guildId,
     orderMode,
-    createdBy
+    createdBy,
+    options.isDebugSession ? 1 : 0,
+    options.ghostCount ?? 0
   );
   return getSessionById(result.lastID as number) as Promise<GameSession>;
 }
@@ -706,6 +715,15 @@ export async function enqueueCrazyPostPendingPrompt(sessionId: number, userId: s
   );
 }
 
+export async function clearCrazyPostPendingPrompts(sessionId: number, userId?: string): Promise<void> {
+  const db = await getDb();
+  if (userId) {
+    await db.run("DELETE FROM crazy_post_pending_prompts WHERE session_id = ? AND user_id = ?", sessionId, userId);
+    return;
+  }
+  await db.run("DELETE FROM crazy_post_pending_prompts WHERE session_id = ?", sessionId);
+}
+
 export async function dequeueCrazyPostPendingPrompt(sessionId: number, userId: string): Promise<number | null> {
   const db = await getDb();
   const row = await db.get(
@@ -781,6 +799,64 @@ export async function setCrazyPostPlayerState(
     userId,
     values.activeMessageId,
     values.activeTextId
+  );
+}
+
+export async function claimCrazyPostActiveText(sessionId: number, userId: string, textId: number): Promise<boolean> {
+  const db = await getDb();
+  await ensureCrazyPostPlayerState(sessionId, userId);
+  const result = await db.run(
+    `UPDATE crazy_post_player_state
+     SET active_text_id = ?
+     WHERE session_id = ? AND user_id = ? AND active_text_id IS NULL`,
+    textId,
+    sessionId,
+    userId
+  );
+  return (result.changes ?? 0) > 0;
+}
+
+export async function setCrazyPostActiveMessageId(sessionId: number, userId: string, messageId: string | null): Promise<void> {
+  const db = await getDb();
+  await db.run(
+    "UPDATE crazy_post_player_state SET active_message_id = ? WHERE session_id = ? AND user_id = ?",
+    messageId,
+    sessionId,
+    userId
+  );
+}
+
+export async function clearCrazyPostActiveTextIfMatches(sessionId: number, userId: string, textId: number): Promise<void> {
+  const db = await getDb();
+  await db.run(
+    `UPDATE crazy_post_player_state
+     SET active_message_id = NULL, active_text_id = NULL
+     WHERE session_id = ? AND user_id = ? AND active_text_id = ?`,
+    sessionId,
+    userId,
+    textId
+  );
+}
+
+export async function setCrazyPostQueueMessageId(sessionId: number, userId: string, messageId: string | null): Promise<void> {
+  const db = await getDb();
+  await ensureCrazyPostPlayerState(sessionId, userId);
+  await db.run(
+    "UPDATE crazy_post_player_state SET queue_message_id = ? WHERE session_id = ? AND user_id = ?",
+    messageId,
+    sessionId,
+    userId
+  );
+}
+
+export async function setCrazyPostQueueWarningActive(sessionId: number, userId: string, active: boolean): Promise<void> {
+  const db = await getDb();
+  await ensureCrazyPostPlayerState(sessionId, userId);
+  await db.run(
+    "UPDATE crazy_post_player_state SET queue_warning_active = ? WHERE session_id = ? AND user_id = ?",
+    active ? 1 : 0,
+    sessionId,
+    userId
   );
 }
 
