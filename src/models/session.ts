@@ -132,6 +132,8 @@ export interface CrazyPostPlayerState {
   userId: string;
   activeMessageId: string | null;
   activeTextId: number | null;
+  queueMessageId: string | null;
+  queueWarningActive: boolean;
 }
 
 export interface FragwuerdigQuestionPair {

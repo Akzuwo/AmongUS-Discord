@@ -18,6 +18,9 @@ import {
   addPlayer,
   addSessionChannel,
   advanceCrazyPostText,
+  claimCrazyPostActiveText,
+  clearCrazyPostActiveTextIfMatches,
+  clearCrazyPostPendingPrompts,
   createCrazyPostSession,
   dequeueCrazyPostPendingPrompt,
   ensureCrazyPostPlayerState,
@@ -34,7 +37,10 @@ import {
   getPlayers,
   getSessionById,
   getTemporarySessionChannelIds,
+  setCrazyPostActiveMessageId,
   setCrazyPostPlayerState,
+  setCrazyPostQueueMessageId,
+  setCrazyPostQueueWarningActive,
   setPlayerChannel,
   setSessionStatus,
   updateSessionChannels
@@ -47,13 +53,18 @@ import { logger } from "../utils/logger";
 const WAITING_TEXT =
   "Aktuell gibt es keinen Text fuer dich zum Weiterschreiben. Du bekommst automatisch eine neue Aufgabe, sobald ein Text verfuegbar ist.";
 const TEXT_COLLECTION_CHANNEL_NAME = "text-sammlung";
+const QUEUE_WARNING_THRESHOLD = 3;
 const crazyPostLogger = logger.scoped("CrazyPost");
+const crazyPostUserLocks = new Map<string, Promise<void>>();
+const crazyPostGhostTimers = new Map<string, NodeJS.Timeout>();
 
 export async function createCrazyPostGameSession(
   guild: Guild,
   creator: GuildMember,
-  orderMode: CrazyPostOrderMode
+  orderMode: CrazyPostOrderMode,
+  options: { isDebugSession?: boolean; ghostCount?: number } = {}
 ): Promise<GameSession> {
+  validateCrazyPostGhostCount(options.ghostCount ?? 0);
   const active = await getAnyActiveSession(guild.id);
   if (active) {
     throw new Error(`Es gibt bereits eine aktive Session: ${active.id}`);
@@ -68,9 +79,12 @@ export async function createCrazyPostGameSession(
     clearBotMessages(admin)
   ]);
 
-  const session = await createCrazyPostSession(guild.id, creator.id, orderMode);
+  const session = await createCrazyPostSession(guild.id, creator.id, orderMode, options);
+  if ((options.ghostCount ?? 0) > 0) {
+    await createCrazyPostGhostPlayers(session.id, options.ghostCount ?? 0);
+  }
   const joinMessage = await signup.send({
-    embeds: [crazyPostLobbyEmbed(session, [])],
+    embeds: [crazyPostLobbyEmbed((await getSessionById(session.id)) as GameSession, await getPlayers(session.id))],
     components: [new ActionRowBuilder<ButtonBuilder>().addComponents(joinButton(session), startButton(session), cancelButton(session))]
   });
   if (signupCreated) {
@@ -86,7 +100,12 @@ export async function createCrazyPostGameSession(
   });
 
   const created = (await getSessionById(session.id)) as GameSession;
-  await admin.send(`Verrueckte-Post-Session ${session.id} erstellt. Reihenfolge: ${formatOrderMode(orderMode)}.`);
+  crazyPostLogger.info(created.isDebugSession ? "Verrueckte-Post-Debugrunde gestartet." : "Verrueckte-Post-Session erstellt.", {
+    sessionId: created.id,
+    ghostCount: created.ghostCount,
+    orderMode
+  });
+  await admin.send(`Verrueckte-Post-${created.isDebugSession ? "Debug-" : ""}Session ${session.id} erstellt. Reihenfolge: ${formatOrderMode(orderMode)}.${created.isDebugSession ? ` Ghost-Spieler: ${created.ghostCount}.` : ""}`);
   await sendCrazyPostAdminControls(admin, created);
   return created;
 }
@@ -120,8 +139,9 @@ export async function startCrazyPostGame(guild: Guild, sessionId: number, userId
   await setSessionStatus(session.id, "starting");
 
   for (const player of players) {
-    const member = await guild.members.fetch(player.userId);
-    const channel = await createPrivateCrazyPostChannel(guild, session.categoryId, player, member);
+    const channel = player.isGhost
+      ? await createPrivateCrazyPostGhostChannel(guild, session.categoryId, player)
+      : await createPrivateCrazyPostChannel(guild, session.categoryId, player, await guild.members.fetch(player.userId));
     await setPlayerChannel(session.id, player.userId, channel.id);
     await addSessionChannel(session.id, channel.id, `crazy_post_player:${player.userId}`, true);
     await ensureCrazyPostPlayerState(session.id, player.userId);
@@ -139,6 +159,9 @@ export async function startCrazyPostGame(guild: Guild, sessionId: number, userId
 
   await setSessionStatus(session.id, "playing");
   await refreshCrazyPostLobby(guild, session.id);
+  if (session.isDebugSession || players.some((player) => player.isGhost)) {
+    crazyPostLogger.info("Verrueckte-Post-Debugrunde spielt.", { sessionId: session.id, ghostCount: players.filter((player) => player.isGhost).length });
+  }
 
   for (const player of await getPlayers(session.id)) {
     await showNextAvailableCrazyPostTask(guild, session.id, player.userId);
@@ -177,31 +200,45 @@ export async function handleCrazyPostPlayerMessage(message: Message): Promise<bo
     return true;
   }
 
-  const text = await getCrazyPostTextById(state.activeTextId);
-  if (!text || text.finished || text.route[text.currentStepIndex] !== player.userId) {
-    await deleteActiveMessage(guild, player, state.activeMessageId);
-    await setCrazyPostPlayerState(session.id, player.userId, { activeMessageId: null, activeTextId: null });
-    await releaseNextCrazyPostTask(guild, session.id, player.userId);
-    return true;
-  }
-
-  await deleteActiveMessage(guild, player, state.activeMessageId);
-  await setCrazyPostPlayerState(session.id, player.userId, { activeMessageId: null, activeTextId: null });
-  await message.delete().catch(() => null);
-
-  await addCrazyPostSentence(text.id, player.userId, content);
-  const nextStepIndex = text.currentStepIndex + 1;
-  const finished = nextStepIndex >= text.route.length;
-  await logCrazyPostSubmission(guild, session, text.id, player, text.currentStepIndex, finished, content);
-  await advanceCrazyPostText(text.id, nextStepIndex, finished);
-
-  if (!finished) {
-    await queueOrSendCrazyPostTask(guild, session.id, text.route[nextStepIndex], text.id);
-  }
-
-  await releaseNextCrazyPostTask(guild, session.id, player.userId);
+  await submitCrazyPostAnswer(guild, session, player, content, message);
   await finishCrazyPostIfComplete(guild, session.id);
   return true;
+}
+
+async function submitCrazyPostAnswer(guild: Guild, session: GameSession, player: Player, content: string, playerMessage?: Message): Promise<void> {
+  await withCrazyPostUserLock(session.id, player.userId, async () => {
+    const lockedState = await getCrazyPostPlayerState(session.id, player.userId);
+    if (!lockedState?.activeTextId) {
+      if (playerMessage) {
+        await playerMessage.reply("Gerade wartet keine Aufgabe auf dich.").catch(() => null);
+      }
+      return;
+    }
+
+    const text = await getCrazyPostTextById(lockedState.activeTextId);
+    if (!text || text.finished || text.route[text.currentStepIndex] !== player.userId) {
+      await deleteActiveMessage(guild, player, lockedState.activeMessageId);
+      await setCrazyPostPlayerState(session.id, player.userId, { activeMessageId: null, activeTextId: null });
+      await releaseNextCrazyPostTaskUnlocked(guild, session.id, player.userId);
+      return;
+    }
+
+    await deleteActiveMessage(guild, player, lockedState.activeMessageId);
+    await setCrazyPostPlayerState(session.id, player.userId, { activeMessageId: null, activeTextId: null });
+    await playerMessage?.delete().catch(() => null);
+
+    await addCrazyPostSentence(text.id, player.userId, content);
+    const nextStepIndex = text.currentStepIndex + 1;
+    const finished = nextStepIndex >= text.route.length;
+    await logCrazyPostSubmission(guild, session, text.id, player, text.currentStepIndex, finished, content);
+    await advanceCrazyPostText(text.id, nextStepIndex, finished);
+
+    if (!finished) {
+      await queueOrSendCrazyPostTask(guild, session.id, text.route[nextStepIndex], text.id);
+    }
+
+    await releaseNextCrazyPostTaskUnlocked(guild, session.id, player.userId);
+  });
 }
 
 export async function cancelCrazyPostSession(guild: Guild, sessionId: number, userId: string, isAdmin: boolean): Promise<string> {
@@ -212,6 +249,7 @@ export async function cancelCrazyPostSession(guild: Guild, sessionId: number, us
     await setSessionStatus(session.id, "cancelled");
   }
   await refreshCrazyPostLobby(guild, session.id);
+  await clearCrazyPostRuntimeState(guild, session.id);
   return deleteCrazyPostChannels(guild, session.id);
 }
 
@@ -235,6 +273,10 @@ export async function refreshCrazyPostLobby(guild: Guild, sessionId: number): Pr
 }
 
 async function showNextAvailableCrazyPostTask(guild: Guild, sessionId: number, userId: string): Promise<void> {
+  await withCrazyPostUserLock(sessionId, userId, () => showNextAvailableCrazyPostTaskUnlocked(guild, sessionId, userId));
+}
+
+async function showNextAvailableCrazyPostTaskUnlocked(guild: Guild, sessionId: number, userId: string): Promise<void> {
   const state = await getCrazyPostPlayerState(sessionId, userId);
   if (state?.activeTextId) {
     crazyPostLogger.debug("Neue Aufgabe nicht zugestellt: Spieler hat bereits aktive Eingabe.", {
@@ -247,7 +289,8 @@ async function showNextAvailableCrazyPostTask(guild: Guild, sessionId: number, u
 
   const pendingTextId = await dequeueCrazyPostPendingPrompt(sessionId, userId);
   if (pendingTextId) {
-    crazyPostLogger.debug("Wartender Text wird nach Absenden freigegeben.", { sessionId, userId, textId: pendingTextId });
+    crazyPostLogger.debug("Wartender Text wird aus der Queue ausgeliefert.", { sessionId, userId, textId: pendingTextId });
+    await updateCrazyPostQueueState(guild, sessionId, userId);
     await sendCrazyPostTask(guild, sessionId, userId, pendingTextId, "pending");
     return;
   }
@@ -270,12 +313,18 @@ async function showNextAvailableCrazyPostTask(guild: Guild, sessionId: number, u
   await deleteActiveMessage(guild, player, state?.activeMessageId ?? null);
   const waiting = await channel.send(WAITING_TEXT);
   await setCrazyPostPlayerState(sessionId, userId, { activeMessageId: waiting.id, activeTextId: null });
+  await updateCrazyPostQueueState(guild, sessionId, userId);
 }
 
 async function queueOrSendCrazyPostTask(guild: Guild, sessionId: number, userId: string, textId: number): Promise<void> {
+  await withCrazyPostUserLock(sessionId, userId, () => queueOrSendCrazyPostTaskUnlocked(guild, sessionId, userId, textId));
+}
+
+async function queueOrSendCrazyPostTaskUnlocked(guild: Guild, sessionId: number, userId: string, textId: number): Promise<void> {
   const state = await getCrazyPostPlayerState(sessionId, userId);
   if (state?.activeTextId) {
     await enqueueCrazyPostPendingPrompt(sessionId, userId, textId);
+    await updateCrazyPostQueueState(guild, sessionId, userId);
     crazyPostLogger.debug("Text wegen aktiver Eingabe zurueckgehalten.", {
       sessionId,
       userId,
@@ -289,13 +338,18 @@ async function queueOrSendCrazyPostTask(guild: Guild, sessionId: number, userId:
 }
 
 async function releaseNextCrazyPostTask(guild: Guild, sessionId: number, userId: string): Promise<void> {
+  await withCrazyPostUserLock(sessionId, userId, () => releaseNextCrazyPostTaskUnlocked(guild, sessionId, userId));
+}
+
+async function releaseNextCrazyPostTaskUnlocked(guild: Guild, sessionId: number, userId: string): Promise<void> {
   const pendingTextId = await dequeueCrazyPostPendingPrompt(sessionId, userId);
   if (pendingTextId) {
-    crazyPostLogger.debug("Wartender Text wird nach Absenden freigegeben.", { sessionId, userId, textId: pendingTextId });
+    crazyPostLogger.debug("Wartender Text wird aus der Queue ausgeliefert.", { sessionId, userId, textId: pendingTextId });
+    await updateCrazyPostQueueState(guild, sessionId, userId);
     await sendCrazyPostTask(guild, sessionId, userId, pendingTextId, "pending");
     return;
   }
-  await showNextAvailableCrazyPostTask(guild, sessionId, userId);
+  await showNextAvailableCrazyPostTaskUnlocked(guild, sessionId, userId);
 }
 
 async function sendCrazyPostTask(guild: Guild, sessionId: number, userId: string, textId: number, source: "direct" | "pending"): Promise<void> {
@@ -310,6 +364,7 @@ async function sendCrazyPostTask(guild: Guild, sessionId: number, userId: string
   const state = await getCrazyPostPlayerState(sessionId, userId);
   if (state?.activeTextId) {
     await enqueueCrazyPostPendingPrompt(sessionId, userId, textId);
+    await updateCrazyPostQueueState(guild, sessionId, userId);
     crazyPostLogger.debug("Text beim Senden zurueckgehalten, weil aktive Eingabe existiert.", {
       sessionId,
       userId,
@@ -322,14 +377,29 @@ async function sendCrazyPostTask(guild: Guild, sessionId: number, userId: string
   if (!text || text.finished || text.route[text.currentStepIndex] !== userId) {
     return;
   }
+  const claimed = await claimCrazyPostActiveText(sessionId, userId, text.id);
+  if (!claimed) {
+    await enqueueCrazyPostPendingPrompt(sessionId, userId, text.id);
+    await updateCrazyPostQueueState(guild, sessionId, userId);
+    crazyPostLogger.debug("Text beim Senden zurueckgehalten, weil parallele Zustellung bereits gewonnen hat.", {
+      sessionId,
+      userId,
+      textId: text.id
+    });
+    return;
+  }
   await deleteActiveMessage(guild, player, state?.activeMessageId ?? null);
   const sentences = await getCrazyPostSentences(text.id);
   const lastSentence = sentences.at(-1)?.content;
   const content = lastSentence
     ? ["**Schreibe genau einen neuen Satz weiter.**", "", "Letzter Satz:", `> ${lastSentence}`].join("\n")
     : "**Starte deinen eigenen Text mit genau einem ersten Satz.**";
-  const taskMessage = await channel.send(content);
-  await setCrazyPostPlayerState(sessionId, userId, { activeMessageId: taskMessage.id, activeTextId: text.id });
+  const taskMessage = await channel.send(content).catch(async (error) => {
+    await clearCrazyPostActiveTextIfMatches(sessionId, userId, text.id);
+    throw error;
+  });
+  await setCrazyPostActiveMessageId(sessionId, userId, taskMessage.id);
+  await updateCrazyPostQueueState(guild, sessionId, userId);
   crazyPostLogger.debug(source === "pending" ? "Wartender Text zugestellt." : "Text direkt zugestellt.", {
     sessionId,
     userId,
@@ -337,6 +407,9 @@ async function sendCrazyPostTask(guild: Guild, sessionId: number, userId: string
     stepIndex: text.currentStepIndex,
     source
   });
+  if (player.isGhost) {
+    await scheduleCrazyPostGhostAnswer(guild, sessionId, player, text.id);
+  }
 }
 
 async function finishCrazyPostIfComplete(guild: Guild, sessionId: number): Promise<void> {
@@ -352,11 +425,7 @@ async function finishCrazyPostIfComplete(guild: Guild, sessionId: number): Promi
 
   await setSessionStatus(sessionId, "ended");
   await refreshCrazyPostLobby(guild, sessionId);
-  for (const player of await getPlayers(sessionId)) {
-    const state = await getCrazyPostPlayerState(sessionId, player.userId);
-    await deleteActiveMessage(guild, player, state?.activeMessageId ?? null);
-    await setCrazyPostPlayerState(sessionId, player.userId, { activeMessageId: null, activeTextId: null });
-  }
+  await clearCrazyPostRuntimeState(guild, sessionId);
   for (const text of texts) {
     await sendFinishedTextToOrigin(guild, sessionId, text.id);
   }
@@ -451,9 +520,21 @@ async function logCrazyPostSubmission(
 }
 
 async function sendFinishedTextsToCollection(guild: Guild, sessionId: number, textIds: number[]): Promise<void> {
+  const session = await requireCrazyPostSession(sessionId);
+  const hasGhostPlayers = (await getPlayers(sessionId)).some((player) => player.isGhost);
+  if (session.isDebugSession || hasGhostPlayers) {
+    crazyPostLogger.info("Textsammlung skipped because session is debug/ghost session.", {
+      sessionId,
+      isDebugSession: session.isDebugSession,
+      hasGhostPlayers
+    });
+    const admin = await getTextChannel(guild, session.adminChannelId);
+    await admin?.send("Debug/Ghost-Runde: text-sammlung wurde bewusst uebersprungen.").catch(() => null);
+    return;
+  }
+
   const channel = await findTextChannelByName(guild, TEXT_COLLECTION_CHANNEL_NAME);
   if (!channel) {
-    const session = await requireCrazyPostSession(sessionId);
     const admin = await getTextChannel(guild, session.adminChannelId);
     await admin?.send(`Channel #${TEXT_COLLECTION_CHANNEL_NAME} wurde nicht gefunden. Fertige Texte konnten dort nicht gesammelt werden.`).catch(() => null);
     return;
@@ -559,6 +640,171 @@ async function getOrCreateTextChannel(guild: Guild, parent: string, name: string
   return { channel: channel as TextChannel, created: true };
 }
 
+async function deleteQueueMessage(guild: Guild, player: Player, messageId: string | null): Promise<void> {
+  await deleteActiveMessage(guild, player, messageId);
+}
+
+async function clearCrazyPostRuntimeState(guild: Guild, sessionId: number): Promise<void> {
+  const session = await getSessionById(sessionId);
+  stopCrazyPostGhostTimers(sessionId);
+  for (const player of await getPlayers(sessionId)) {
+    await withCrazyPostUserLock(sessionId, player.userId, async () => {
+      const state = await getCrazyPostPlayerState(sessionId, player.userId);
+      await deleteActiveMessage(guild, player, state?.activeMessageId ?? null);
+      await deleteQueueMessage(guild, player, state?.queueMessageId ?? null);
+      await setCrazyPostPlayerState(sessionId, player.userId, { activeMessageId: null, activeTextId: null });
+      await setCrazyPostQueueMessageId(sessionId, player.userId, null);
+      await setCrazyPostQueueWarningActive(sessionId, player.userId, false);
+    });
+  }
+  await clearCrazyPostPendingPrompts(sessionId);
+  crazyPostLogger.debug("Aktive Texte und Queues fuer Session geleert.", { sessionId });
+  if (session?.isDebugSession || (session?.ghostCount ?? 0) > 0) {
+    crazyPostLogger.info("Verrueckte-Post-Debugrunde beendet.", { sessionId, ghostCount: session?.ghostCount ?? 0 });
+  }
+}
+
+async function updateCrazyPostQueueState(guild: Guild, sessionId: number, userId: string): Promise<void> {
+  await updateCrazyPostQueueMessage(guild, sessionId, userId);
+  await updateCrazyPostQueueWarning(guild, sessionId, userId);
+}
+
+async function updateCrazyPostQueueMessage(guild: Guild, sessionId: number, userId: string): Promise<void> {
+  const player = await getPlayer(sessionId, userId);
+  if (!player) {
+    return;
+  }
+  const channel = await getTextChannel(guild, player.channelId);
+  if (!channel) {
+    return;
+  }
+  const pendingTextIds = await getCrazyPostPendingPromptIds(sessionId, userId);
+  const content = `Warteschlange: ${pendingTextIds.length} ${pendingTextIds.length === 1 ? "Satz" : "Sätze"}`;
+  const state = await getCrazyPostPlayerState(sessionId, userId);
+  const existing = state?.queueMessageId ? await channel.messages.fetch(state.queueMessageId).catch(() => null) : null;
+  if (existing) {
+    await existing.edit(content).catch(() => null);
+    return;
+  }
+  const message = await channel.send(content).catch(() => null);
+  if (message) {
+    await setCrazyPostQueueMessageId(sessionId, userId, message.id);
+  }
+}
+
+async function updateCrazyPostQueueWarning(guild: Guild, sessionId: number, userId: string): Promise<void> {
+  const pendingTextIds = await getCrazyPostPendingPromptIds(sessionId, userId);
+  const state = await getCrazyPostPlayerState(sessionId, userId);
+  if (pendingTextIds.length <= QUEUE_WARNING_THRESHOLD) {
+    if (state?.queueWarningActive) {
+      await setCrazyPostQueueWarningActive(sessionId, userId, false);
+      crazyPostLogger.debug("Queue-Warnstatus zurueckgesetzt.", { sessionId, userId, queueSize: pendingTextIds.length });
+    }
+    return;
+  }
+  if (state?.queueWarningActive) {
+    return;
+  }
+  const session = await requireCrazyPostSession(sessionId);
+  const admin = await getTextChannel(guild, session.adminChannelId);
+  const player = await getPlayer(sessionId, userId);
+  const label = player?.isGhost ? player.username : `<@${userId}>`;
+  await admin?.send(`⚠️ Bei ${label} stauen sich aktuell ${pendingTextIds.length} Sätze in Verrückte Post.`).catch(() => null);
+  await setCrazyPostQueueWarningActive(sessionId, userId, true);
+  crazyPostLogger.debug("Admin-Warnung wegen Queue > 3 gesendet.", { sessionId, userId, queueSize: pendingTextIds.length });
+}
+
+async function scheduleCrazyPostGhostAnswer(guild: Guild, sessionId: number, player: Player, textId: number): Promise<void> {
+  const key = ghostTimerKey(sessionId, player.userId);
+  const existing = crazyPostGhostTimers.get(key);
+  if (existing) {
+    clearTimeout(existing);
+  }
+
+  const pendingTextIds = await getCrazyPostPendingPromptIds(sessionId, player.userId);
+  const delayMs = 4000 + Math.floor(Math.random() * 3001);
+  crazyPostLogger.info("Ghost-Spieler hat Satz erhalten.", { sessionId, userId: player.userId, username: player.username, textId, queueLength: pendingTextIds.length });
+  crazyPostLogger.info("Ghost-Spieler beginnt simuliertes Schreiben.", { sessionId, userId: player.userId, textId, delayMs });
+
+  const timer = setTimeout(() => {
+    crazyPostGhostTimers.delete(key);
+    void handleCrazyPostGhostTimer(guild, sessionId, player.userId, textId, delayMs);
+  }, delayMs);
+  crazyPostGhostTimers.set(key, timer);
+}
+
+async function handleCrazyPostGhostTimer(guild: Guild, sessionId: number, userId: string, textId: number, delayMs: number): Promise<void> {
+  const session = await getSessionById(sessionId);
+  if (!session || session.status !== "playing") {
+    crazyPostLogger.info("Ghost-Task gestoppt: Session nicht mehr aktiv.", { sessionId, userId, textId });
+    return;
+  }
+
+  const player = await getPlayer(sessionId, userId);
+  if (!player?.isGhost) {
+    return;
+  }
+
+  const state = await getCrazyPostPlayerState(sessionId, userId);
+  if (state?.activeTextId !== textId) {
+    crazyPostLogger.info("Ghost-Antwort verworfen: aktiver Satz passt nicht mehr.", {
+      sessionId,
+      userId,
+      scheduledTextId: textId,
+      activeTextId: state?.activeTextId ?? null
+    });
+    return;
+  }
+
+  const pendingTextIds = await getCrazyPostPendingPromptIds(sessionId, userId);
+  const content = `Debug Antwort ${Date.now() % 100000} von ${player.username}`;
+  crazyPostLogger.info("Ghost-Spieler antwortet nach Verzoegerung.", {
+    sessionId,
+    userId,
+    username: player.username,
+    textId,
+    delayMs,
+    queueLength: pendingTextIds.length
+  });
+  await submitCrazyPostAnswer(guild, session, player, content);
+  await finishCrazyPostIfComplete(guild, sessionId);
+}
+
+function stopCrazyPostGhostTimers(sessionId: number): void {
+  for (const [key, timer] of crazyPostGhostTimers.entries()) {
+    if (!key.startsWith(`${sessionId}:`)) {
+      continue;
+    }
+    clearTimeout(timer);
+    crazyPostGhostTimers.delete(key);
+  }
+  crazyPostLogger.info("Ghost-Tasks wurden sauber gestoppt.", { sessionId });
+}
+
+function ghostTimerKey(sessionId: number, userId: string): string {
+  return `${sessionId}:${userId}`;
+}
+
+async function withCrazyPostUserLock<T>(sessionId: number, userId: string, task: () => Promise<T>): Promise<T> {
+  const key = `${sessionId}:${userId}`;
+  const previous = crazyPostUserLocks.get(key) ?? Promise.resolve();
+  let release!: () => void;
+  const next = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const tail = previous.catch(() => undefined).then(() => next);
+  crazyPostUserLocks.set(key, tail);
+  await previous.catch(() => undefined);
+  try {
+    return await task();
+  } finally {
+    release();
+    if (crazyPostUserLocks.get(key) === tail) {
+      crazyPostUserLocks.delete(key);
+    }
+  }
+}
+
 async function getOrCreateSignupChannel(guild: Guild, parent: string, name: string, creatorId: string): Promise<{ channel: TextChannel; created: boolean }> {
   const result = await getOrCreateTextChannel(guild, parent, name);
   const channel = result.channel;
@@ -601,6 +847,30 @@ async function createPrivateCrazyPostChannel(guild: Guild, parent: string, playe
   return channel as TextChannel;
 }
 
+async function createPrivateCrazyPostGhostChannel(guild: Guild, parent: string, player: Player): Promise<TextChannel> {
+  const overwrites = dedupePermissionOverwrites([
+    { id: guild.roles.everyone.id, deny: [PermissionFlagsBits.ViewChannel] },
+    {
+      id: guild.client.user.id,
+      allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.ReadMessageHistory, PermissionFlagsBits.ManageMessages]
+    },
+    { id: guild.ownerId, allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.ReadMessageHistory] }
+  ]);
+
+  const adminRole = config.adminRole ? guild.roles.cache.find((role) => role.id === config.adminRole || role.name === config.adminRole) : null;
+  if (adminRole) {
+    overwrites.push({ id: adminRole.id, allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.ReadMessageHistory] });
+  }
+
+  const channel = await guild.channels.create({
+    name: `post-${safeChannelName(player.username)}`,
+    type: ChannelType.GuildText,
+    parent,
+    permissionOverwrites: overwrites
+  });
+  return channel as TextChannel;
+}
+
 async function clearBotMessages(channel: TextChannel): Promise<void> {
   const messages = await channel.messages.fetch({ limit: 50 }).catch((error) => {
     console.error(`Messages in ${channel.name} could not be fetched`, error);
@@ -623,8 +893,8 @@ async function clearBotMessages(channel: TextChannel): Promise<void> {
 function crazyPostLobbyEmbed(session: GameSession, players: Player[]): EmbedBuilder {
   return new EmbedBuilder()
     .setTitle(`Verrueckte Post Anmeldung ${session.id}`)
-    .setDescription(`Status: ${session.status}\nReihenfolge: ${formatOrderMode(session.orderMode)}\nSpieler: ${players.length}`)
-    .addFields({ name: "Angemeldet", value: players.length ? players.map((player) => `<@${player.userId}>`).join("\n") : "Noch niemand." });
+    .setDescription(`Status: ${session.status}${session.isDebugSession ? "\nDebug-Runde aktiv" : ""}\nReihenfolge: ${formatOrderMode(session.orderMode)}\nSpieler: ${players.length}`)
+    .addFields({ name: "Angemeldet", value: players.length ? players.map(formatCrazyPostPlayerForLobby).join("\n") : "Noch niemand." });
 }
 
 async function sendCrazyPostAdminControls(channel: TextChannel, session: GameSession): Promise<void> {
@@ -660,7 +930,14 @@ function formatFinishedText(sentences: Awaited<ReturnType<typeof getCrazyPostSen
 }
 
 function formatPlayerForAdmin(player: Player): string {
+  if (player.isGhost) {
+    return `${player.username} / Ghost (${player.userId})`;
+  }
   return `${player.username} / <@${player.userId}> (${player.userId})`;
+}
+
+function formatCrazyPostPlayerForLobby(player: Player): string {
+  return player.isGhost ? `${player.username} (Ghost)` : `<@${player.userId}>`;
 }
 
 function formatPlayerIdForAdmin(players: Player[], userId: string): string {
@@ -699,6 +976,24 @@ async function findTextChannelIdByName(guild: Guild, name: string): Promise<stri
 
 function formatOrderMode(orderMode: CrazyPostOrderMode | null): string {
   return orderMode === "random" ? "zufaellig" : "statisch";
+}
+
+async function createCrazyPostGhostPlayers(sessionId: number, ghostCount: number): Promise<void> {
+  for (let index = 1; index <= ghostCount; index += 1) {
+    const userId = `ghost:post:${sessionId}:${index}`;
+    const username = `Ghost ${index}`;
+    await addPlayer(sessionId, userId, username, { discordUserId: null, isGhost: true });
+    crazyPostLogger.debug("Verrueckte-Post-Ghost-Spieler hinzugefuegt.", { sessionId, userId, username });
+  }
+}
+
+function validateCrazyPostGhostCount(ghostCount: number): void {
+  if (!Number.isInteger(ghostCount) || ghostCount < 0) {
+    throw new Error("Bitte gib eine gueltige Anzahl Ghost-Spieler an.");
+  }
+  if (ghostCount > config.debugMaxGhostPlayers) {
+    throw new Error(`Maximal ${config.debugMaxGhostPlayers} Ghost-Spieler sind erlaubt.`);
+  }
 }
 
 function assertHostOrAdmin(session: GameSession, userId: string, isAdmin: boolean, message: string): void {

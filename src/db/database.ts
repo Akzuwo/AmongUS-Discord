@@ -166,6 +166,8 @@ export async function initDb(): Promise<void> {
       user_id TEXT NOT NULL,
       active_message_id TEXT,
       active_text_id INTEGER,
+      queue_message_id TEXT,
+      queue_warning_active INTEGER NOT NULL DEFAULT 0,
       PRIMARY KEY(session_id, user_id),
       FOREIGN KEY(session_id) REFERENCES sessions(id) ON DELETE CASCADE,
       FOREIGN KEY(active_text_id) REFERENCES crazy_post_texts(id) ON DELETE SET NULL
@@ -265,6 +267,8 @@ export async function initDb(): Promise<void> {
   await ensureColumn(database, "player_tasks", "title", "TEXT");
   await ensureColumn(database, "player_tasks", "location", "TEXT");
   await ensureColumn(database, "player_tasks", "completed_at", "TEXT");
+  await ensureColumn(database, "crazy_post_player_state", "queue_message_id", "TEXT");
+  await ensureColumn(database, "crazy_post_player_state", "queue_warning_active", "INTEGER NOT NULL DEFAULT 0");
   await database.run("UPDATE players SET discord_user_id = user_id WHERE discord_user_id IS NULL AND (is_ghost IS NULL OR is_ghost = 0)");
   await database.run("UPDATE player_tasks SET title = description WHERE title IS NULL OR title = ''");
 }
