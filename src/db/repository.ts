@@ -252,53 +252,60 @@ export async function getActiveSession(guildId: string): Promise<GameSession | n
   return row ? mapSession(row) : null;
 }
 
-export async function getLatestSession(): Promise<GameSession | null> {
+export async function getLatestSession(guildId?: string): Promise<GameSession | null> {
   const db = await getDb();
-  const row = await db.get("SELECT * FROM sessions ORDER BY id DESC LIMIT 1");
+  const row = guildId
+    ? await db.get("SELECT * FROM sessions WHERE guild_id = ? ORDER BY id DESC LIMIT 1", guildId)
+    : await db.get("SELECT * FROM sessions ORDER BY id DESC LIMIT 1");
   return row ? mapSession(row) : null;
 }
 
-export async function getLatestActiveSession(): Promise<GameSession | null> {
+export async function getLatestActiveSession(guildId?: string): Promise<GameSession | null> {
   const db = await getDb();
-  const row = await db.get("SELECT * FROM sessions WHERE status NOT IN ('ended', 'cancelled', 'finished') ORDER BY id DESC LIMIT 1");
+  const row = guildId
+    ? await db.get(
+      "SELECT * FROM sessions WHERE guild_id = ? AND status NOT IN ('ended', 'cancelled', 'finished') ORDER BY id DESC LIMIT 1",
+      guildId
+    )
+    : await db.get("SELECT * FROM sessions WHERE status NOT IN ('ended', 'cancelled', 'finished') ORDER BY id DESC LIMIT 1");
   return row ? mapSession(row) : null;
 }
 
-export async function getAnyActiveSession(): Promise<GameSession | null> {
-  const db = await getDb();
-  const row = await db.get(
-    "SELECT * FROM sessions WHERE status NOT IN ('ended', 'cancelled', 'finished') ORDER BY id DESC LIMIT 1"
-  );
-  return row ? mapSession(row) : null;
+export async function getAnyActiveSession(guildId: string): Promise<GameSession | null> {
+  return getLatestActiveSession(guildId);
 }
 
-export async function getActiveFragwuerdigSessionByChannel(channelId: string): Promise<GameSession | null> {
+export async function getActiveFragwuerdigSessionByChannel(guildId: string, channelId: string): Promise<GameSession | null> {
   const db = await getDb();
   const row = await db.get(
     `SELECT sessions.*
      FROM sessions
      JOIN players ON players.session_id = sessions.id
-     WHERE sessions.game_type = 'fragwuerdig'
+     WHERE sessions.guild_id = ?
+       AND sessions.game_type = 'fragwuerdig'
        AND sessions.status IN ('answering', 'voting', 'round_finished')
        AND players.channel_id = ?
      ORDER BY sessions.id DESC
      LIMIT 1`,
+    guildId,
     channelId
   );
   return row ? mapSession(row) : null;
 }
 
-export async function getActiveCrazyPostSessionByChannel(channelId: string): Promise<GameSession | null> {
+export async function getActiveCrazyPostSessionByChannel(guildId: string, channelId: string): Promise<GameSession | null> {
   const db = await getDb();
   const row = await db.get(
     `SELECT sessions.*
      FROM sessions
      JOIN players ON players.session_id = sessions.id
-     WHERE sessions.game_type = 'crazy_post'
+     WHERE sessions.guild_id = ?
+       AND sessions.game_type = 'crazy_post'
        AND sessions.status = 'playing'
        AND players.channel_id = ?
      ORDER BY sessions.id DESC
      LIMIT 1`,
+    guildId,
     channelId
   );
   return row ? mapSession(row) : null;

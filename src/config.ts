@@ -1,5 +1,7 @@
 import "dotenv/config";
 
+const DISCORD_ID_PATTERN = /^\d{17,20}$/;
+
 function required(name: string): string {
   const value = process.env[name];
   if (!value) {
@@ -8,10 +10,30 @@ function required(name: string): string {
   return value;
 }
 
+function parseAllowedGuilds(): { allowedGuilds: string[]; invalidAllowedGuilds: string[]; emptyAllowedGuildEntries: number } {
+  const rawEntries = (process.env.ALLOWED_GUILDS || "").split(",");
+  const emptyAllowedGuildEntries = rawEntries.filter((entry) => entry.trim().length === 0).length;
+  const unique = [...new Set(rawEntries.map((entry) => entry.trim()).filter(Boolean))];
+  return {
+    allowedGuilds: unique.filter((value) => DISCORD_ID_PATTERN.test(value)),
+    invalidAllowedGuilds: unique.filter((value) => !DISCORD_ID_PATTERN.test(value)),
+    emptyAllowedGuildEntries
+  };
+}
+
+const guildConfig = parseAllowedGuilds();
+const botEnv = (process.env.BOT_ENV || process.env.NODE_ENV || "development").toLowerCase();
+
 export const config = {
   token: required("DISCORD_TOKEN"),
   clientId: required("CLIENT_ID"),
-  guildId: process.env.GUILD_ID || undefined,
+  rawAllowedGuilds: process.env.ALLOWED_GUILDS || "",
+  allowedGuilds: guildConfig.allowedGuilds,
+  invalidAllowedGuilds: guildConfig.invalidAllowedGuilds,
+  emptyAllowedGuildEntries: guildConfig.emptyAllowedGuildEntries,
+  botEnv,
+  isProduction: botEnv === "production" || botEnv === "prod",
+  singleGuildMode: (process.env.SINGLE_GUILD_MODE || "false").toLowerCase() === "true",
   adminRole: process.env.ADMIN_ROLE || undefined,
   databasePath: process.env.DATABASE_PATH || "./data/amongus.sqlite",
   tasksPath: process.env.TASKS_PATH || "./data/tasks.json",

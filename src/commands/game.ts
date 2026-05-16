@@ -1,14 +1,16 @@
-import { ChatInputCommandInteraction, GuildMember, MessageFlags } from "discord.js";
-import { isAdminInteraction } from "../services/authService";
+import { ChatInputCommandInteraction, MessageFlags } from "discord.js";
+import { isAdminMember } from "../services/authService";
 import { createFragwuerdigGameSession } from "../services/fragwuerdigService";
 import { safeReply } from "../utils/interactionResponses";
+import { resolveCommandGuildContext } from "../utils/guildContext";
 
 export async function handleGameCommand(interaction: ChatInputCommandInteraction): Promise<void> {
-  if (!interaction.guild || !(interaction.member instanceof GuildMember)) {
-    await safeReply(interaction, "Dieser Command funktioniert nur auf einem Server.");
+  const context = await resolveCommandGuildContext(interaction);
+  if (!context.ok) {
+    await safeReply(interaction, context.message);
     return;
   }
-  if (!isAdminInteraction(interaction)) {
+  if (!isAdminMember(context.member)) {
     await safeReply(interaction, "Nur die Spielleitung kann diesen Command benutzen.");
     return;
   }
@@ -31,7 +33,7 @@ export async function handleGameCommand(interaction: ChatInputCommandInteraction
       await interaction.editReply("impostor_anzahl muss 1 oder 2 sein.");
       return;
     }
-    const session = await createFragwuerdigGameSession(interaction.guild, interaction.member, impostorCount);
+    const session = await createFragwuerdigGameSession(context.guild, context.member, impostorCount);
     await interaction.editReply(`Fragwuerdig-Session ${session.id} erstellt. Anmeldung: <#${session.lobbyChannelId}>`);
   } catch (error) {
     const message = error instanceof Error ? error.message : "Unbekannter Fehler.";

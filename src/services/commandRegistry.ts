@@ -1,5 +1,9 @@
 import { REST, Routes, SlashCommandBuilder } from "discord.js";
 import { config } from "../config";
+import { allowedGuildIds } from "./guildAccessService";
+import { logger } from "../utils/logger";
+
+const commandLogger = logger.scoped("CommandRegistry");
 
 export const amongUsCommand = new SlashCommandBuilder()
   .setName("amongus")
@@ -119,8 +123,14 @@ export async function registerCommands(): Promise<void> {
   const rest = new REST({ version: "10" }).setToken(config.token);
   const body = [amongUsCommand.toJSON(), crazyPostCommand.toJSON(), gameCommand.toJSON()];
 
-  if (config.guildId) {
-    await rest.put(Routes.applicationGuildCommands(config.clientId, config.guildId), { body });
+  const guildIds = allowedGuildIds();
+  if (guildIds.length > 0) {
+    await Promise.all(guildIds.map((guildId) => rest.put(Routes.applicationGuildCommands(config.clientId, guildId), { body })));
+    return;
+  }
+
+  if (config.isProduction) {
+    commandLogger.error("Slash-Commands werden nicht registriert, weil ALLOWED_GUILDS im Production-Modus leer ist.");
     return;
   }
 

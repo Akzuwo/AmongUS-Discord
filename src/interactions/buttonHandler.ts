@@ -1,6 +1,6 @@
-import { ActionRowBuilder, ButtonBuilder, ButtonInteraction, ButtonStyle, GuildMember, MessageFlags } from "discord.js";
+import { ActionRowBuilder, ButtonBuilder, ButtonInteraction, ButtonStyle, Guild, GuildMember, MessageFlags } from "discord.js";
 import { getActiveSession } from "../db/repository";
-import { isAdminInteraction } from "../services/authService";
+import { isAdminMember } from "../services/authService";
 import { cancelCrazyPostSession, joinCrazyPostSession, startCrazyPostGame } from "../services/crazyPostService";
 import {
   endFragwuerdigByHost,
@@ -19,30 +19,39 @@ import {
   joinSession,
   killSelectMenu,
   recordFalseBodyReport,
-  reportBodyModal,
+  scopedReportBodyModal,
   sendAdminStatus,
   startEmergencyMeeting,
   startGame,
   taskMessageOptions
 } from "../services/gameService";
 import { ids } from "../utils/customIds";
-import { parseCustomId } from "../utils/customIds";
+import { parseCustomId, parseScopedCustomId } from "../utils/customIds";
+import { resolveInteractionGuildContext, SERVER_ONLY_INTERACTION_MESSAGE } from "../utils/guildContext";
 import { safeReply } from "../utils/interactionResponses";
 
+type ButtonGuildContext = { guild: Guild; member: GuildMember; guildId: string };
+
 export async function handleButton(interaction: ButtonInteraction): Promise<void> {
-  if (!interaction.guild || !(interaction.member instanceof GuildMember)) {
-    await safeReply(interaction, "Diese Interaktion funktioniert nur auf einem Server.");
+  const context = await resolveInteractionGuildContext(interaction, SERVER_ONLY_INTERACTION_MESSAGE);
+  if (!context.ok) {
+    await safeReply(interaction, context.message);
     return;
   }
 
   const parts = parseCustomId(interaction.customId);
+  const scoped = parseScopedCustomId(parts, context.guildId);
+  if (!scoped) {
+    await safeReply(interaction, "Diese Session existiert nicht mehr oder gehoert zu einem anderen Server.");
+    return;
+  }
   if (parts[0] === "post") {
-    await handleCrazyPostButton(interaction, parts);
+    await handleCrazyPostButton(interaction, scoped, context);
     return;
   }
 
   if (parts[0] === "frag") {
-    await handleFragwuerdigButton(interaction, parts);
+    await handleFragwuerdigButton(interaction, scoped, context);
     return;
   }
 
@@ -51,39 +60,39 @@ export async function handleButton(interaction: ButtonInteraction): Promise<void
   }
 
   try {
-    const action = parts[1];
+    const { action, sessionId, args } = scoped;
 
     if (action === "join") {
       await interaction.deferReply({ flags: MessageFlags.Ephemeral });
-      await joinSession(interaction.guild, Number(parts[2]), interaction.member);
+      await joinSession(context.guild, sessionId, context.member);
       await interaction.editReply("Du bist der Session beigetreten.");
       return;
     }
 
     if (action === "start") {
-      if (!isAdminInteraction(interaction)) {
+      if (!isAdminMember(context.member)) {
         await safeReply(interaction, "Nur die Spielleitung kann das Spiel starten.");
         return;
       }
       await interaction.deferReply({ flags: MessageFlags.Ephemeral });
-      await startGame(interaction.guild, Number(parts[2]));
+      await startGame(context.guild, sessionId);
       await interaction.editReply("Spiel gestartet.");
       return;
     }
 
     if (action === "admin-status") {
-      if (!isAdminInteraction(interaction)) {
+      if (!isAdminMember(context.member)) {
         await safeReply(interaction, "Nur die Spielleitung kann den Status aktualisieren.");
         return;
       }
       await interaction.deferReply({ flags: MessageFlags.Ephemeral });
-      await sendAdminStatus(interaction.guild, Number(parts[2]));
+      await sendAdminStatus(context.guild, sessionId);
       await interaction.editReply("Status wurde aktualisiert.");
       return;
     }
 
     if (action === "delete-prompt") {
-      if (!isAdminInteraction(interaction)) {
+      if (!isAdminMember(context.member)) {
         await safeReply(interaction, "Nur die Spielleitung kann die Session aufraeumen.");
         return;
       }
@@ -92,8 +101,8 @@ export async function handleButton(interaction: ButtonInteraction): Promise<void
         flags: MessageFlags.Ephemeral,
         components: [
           new ActionRowBuilder<ButtonBuilder>().addComponents(
-            new ButtonBuilder().setCustomId(ids.deleteConfirm(Number(parts[2]))).setLabel("Ja, Session aufraeumen").setStyle(ButtonStyle.Danger),
-            new ButtonBuilder().setCustomId(ids.deleteCancel(Number(parts[2]))).setLabel("Abbrechen").setStyle(ButtonStyle.Secondary)
+            new ButtonBuilder().setCustomId(ids.deleteConfirm(context.guildId, sessionId)).setLabel("Ja, Session aufraeumen").setStyle(ButtonStyle.Danger),
+            new ButtonBuilder().setCustomId(ids.deleteCancel(context.guildId, sessionId)).setLabel("Abbrechen").setStyle(ButtonStyle.Secondary)
           )
         ]
       });
@@ -106,26 +115,26 @@ export async function handleButton(interaction: ButtonInteraction): Promise<void
     }
 
     if (action === "delete-confirm") {
-      if (!isAdminInteraction(interaction)) {
+      if (!isAdminMember(context.member)) {
         await safeReply(interaction, "Nur die Spielleitung kann die Session aufraeumen.");
         return;
       }
       await interaction.deferReply({ flags: MessageFlags.Ephemeral });
-      const result = await cancelAndDeleteSession(interaction.guild, Number(parts[2]));
+      const result = await cancelAndDeleteSession(context.guild, sessionId);
       await interaction.editReply(result);
       return;
     }
 
     if (action === "emergency") {
       await interaction.deferReply({ flags: MessageFlags.Ephemeral });
-      await startEmergencyMeeting(interaction.guild, Number(parts[2]), interaction.user.id);
+      await startEmergencyMeeting(context.guild, sessionId, interaction.user.id);
       await interaction.editReply("Emergency Meeting wurde einberufen.");
       return;
     }
 
     if (action === "task-done") {
       await interaction.deferUpdate();
-      await completeTask(interaction.guild, Number(parts[2]), interaction.user.id);
+      await completeTask(context.guild, Number(args[0]), interaction.user.id, sessionId);
       await interaction.message.edit({ components: [] });
       await interaction.followUp({ content: "Task als erledigt markiert.", flags: MessageFlags.Ephemeral });
       return;
@@ -133,15 +142,15 @@ export async function handleButton(interaction: ButtonInteraction): Promise<void
 
     if (action === "task-step") {
       await interaction.deferUpdate();
-      const result = await completeTaskStep(interaction.guild, Number(parts[2]), Number(parts[3]), Number(parts[4]), interaction.user.id);
-      await interaction.message.edit(taskMessageOptions(result.task, true));
+      const result = await completeTaskStep(context.guild, sessionId, Number(args[0]), Number(args[1]), interaction.user.id);
+      await interaction.message.edit(taskMessageOptions(result.task, true, context.guildId));
       await interaction.followUp({ content: result.message, flags: MessageFlags.Ephemeral });
       return;
     }
 
     if (action === "kill") {
       await interaction.deferReply({ flags: MessageFlags.Ephemeral });
-      const menu = await killSelectMenu(interaction.guild, Number(parts[2]), interaction.user.id);
+      const menu = await killSelectMenu(context.guild, sessionId, interaction.user.id);
       await interaction.editReply({
         content: "Wen hast du getoetet?",
         components: [new ActionRowBuilder<typeof menu>().addComponents(menu)]
@@ -150,48 +159,52 @@ export async function handleButton(interaction: ButtonInteraction): Promise<void
     }
 
     if (action === "report-body") {
-      const hasUnreportedBody = await canOpenBodyReportModal(interaction.guild, Number(parts[2]), interaction.user.id);
+      const hasUnreportedBody = await canOpenBodyReportModal(context.guild, sessionId, interaction.user.id);
       if (!hasUnreportedBody) {
         await interaction.deferReply({ flags: MessageFlags.Ephemeral });
-        const message = await recordFalseBodyReport(interaction.guild, Number(parts[2]), interaction.user.id);
+        const message = await recordFalseBodyReport(context.guild, sessionId, interaction.user.id);
         await interaction.editReply(message);
         return;
       }
-      await interaction.showModal(reportBodyModal(Number(parts[2])));
+      await interaction.showModal(scopedReportBodyModal(context.guildId, sessionId));
       return;
     }
 
     if (action === "vote") {
       await interaction.deferReply({ flags: MessageFlags.Ephemeral });
-      const target = parts[3];
-      const message = await castVote(interaction.guild, Number(parts[2]), interaction.user.id, target);
+      const target = args[0];
+      const message = await castVote(context.guild, sessionId, interaction.user.id, target);
       await interaction.editReply(message);
       return;
     }
 
     if (action === "end") {
-      if (!isAdminInteraction(interaction)) {
+      if (!isAdminMember(context.member)) {
         await safeReply(interaction, "Nur die Spielleitung kann die Session beenden.");
         return;
       }
       await interaction.deferReply({ flags: MessageFlags.Ephemeral });
-      const session = await getActiveSession(interaction.guild.id);
+      const session = await getActiveSession(context.guildId);
       if (!session) {
         await interaction.editReply("Keine aktive Session gefunden.");
         return;
       }
-      await endSession(interaction.guild, session.id);
+      if (session.id !== sessionId) {
+        await interaction.editReply("Diese Session existiert nicht mehr oder gehoert zu einem anderen Server.");
+        return;
+      }
+      await endSession(context.guild, sessionId);
       await interaction.editReply("Session beendet.");
       return;
     }
 
     if (action === "confirm-end") {
-      if (!isAdminInteraction(interaction)) {
+      if (!isAdminMember(context.member)) {
         await safeReply(interaction, "Nur die Spielleitung kann die Session aufraeumen.");
         return;
       }
       await interaction.deferReply({ flags: MessageFlags.Ephemeral });
-      const result = await deleteSessionChannels(interaction.guild, Number(parts[2]));
+      const result = await deleteSessionChannels(context.guild, sessionId);
       await interaction.editReply(result);
       return;
     }
@@ -203,42 +216,45 @@ export async function handleButton(interaction: ButtonInteraction): Promise<void
   }
 }
 
-async function handleFragwuerdigButton(interaction: ButtonInteraction, parts: string[]): Promise<void> {
+async function handleFragwuerdigButton(
+  interaction: ButtonInteraction,
+  scoped: { action: string; sessionId: number; args: string[] },
+  context: ButtonGuildContext
+): Promise<void> {
   try {
-    const action = parts[1];
-    const sessionId = Number(parts[2]);
+    const { action, sessionId } = scoped;
 
     if (action === "join") {
       await interaction.deferReply({ flags: MessageFlags.Ephemeral });
-      const message = await joinFragwuerdigSession(interaction.guild!, sessionId, interaction.member as GuildMember);
+      const message = await joinFragwuerdigSession(context.guild, sessionId, context.member);
       await interaction.editReply(message);
       return;
     }
 
     if (action === "start" || action === "next") {
       await interaction.deferReply({ flags: MessageFlags.Ephemeral });
-      await startFragwuerdigRound(interaction.guild!, sessionId, interaction.user.id, isAdminInteraction(interaction));
+      await startFragwuerdigRound(context.guild, sessionId, interaction.user.id, isAdminMember(context.member));
       await interaction.editReply("Fragwuerdig-Runde gestartet.");
       return;
     }
 
     if (action === "continue") {
       await interaction.deferReply({ flags: MessageFlags.Ephemeral });
-      const message = await markFragwuerdigContinue(interaction.guild!, sessionId, interaction.user.id, true);
+      const message = await markFragwuerdigContinue(context.guild, sessionId, interaction.user.id, true);
       await interaction.editReply(message);
       return;
     }
 
     if (action === "stop") {
       await interaction.deferReply({ flags: MessageFlags.Ephemeral });
-      const message = await markFragwuerdigContinue(interaction.guild!, sessionId, interaction.user.id, false);
+      const message = await markFragwuerdigContinue(context.guild, sessionId, interaction.user.id, false);
       await interaction.editReply(message);
       return;
     }
 
     if (action === "cancel" || action === "end") {
       await interaction.deferReply({ flags: MessageFlags.Ephemeral });
-      const message = await endFragwuerdigByHost(interaction.guild!, sessionId, interaction.user.id, isAdminInteraction(interaction));
+      const message = await endFragwuerdigByHost(context.guild, sessionId, interaction.user.id, isAdminMember(context.member));
       await interaction.editReply(message);
       return;
     }
@@ -250,28 +266,31 @@ async function handleFragwuerdigButton(interaction: ButtonInteraction, parts: st
   }
 }
 
-async function handleCrazyPostButton(interaction: ButtonInteraction, parts: string[]): Promise<void> {
+async function handleCrazyPostButton(
+  interaction: ButtonInteraction,
+  scoped: { action: string; sessionId: number; args: string[] },
+  context: ButtonGuildContext
+): Promise<void> {
   try {
-    const action = parts[1];
-    const sessionId = Number(parts[2]);
+    const { action, sessionId } = scoped;
 
     if (action === "join") {
       await interaction.deferReply({ flags: MessageFlags.Ephemeral });
-      await joinCrazyPostSession(interaction.guild!, sessionId, interaction.member as GuildMember);
+      await joinCrazyPostSession(context.guild, sessionId, context.member);
       await interaction.editReply("Du bist der Verrueckte-Post-Session beigetreten.");
       return;
     }
 
     if (action === "start") {
       await interaction.deferReply({ flags: MessageFlags.Ephemeral });
-      await startCrazyPostGame(interaction.guild!, sessionId, interaction.user.id, isAdminInteraction(interaction));
+      await startCrazyPostGame(context.guild, sessionId, interaction.user.id, isAdminMember(context.member));
       await interaction.editReply("Verrueckte Post gestartet.");
       return;
     }
 
     if (action === "delete") {
       await interaction.deferReply({ flags: MessageFlags.Ephemeral });
-      const result = await cancelCrazyPostSession(interaction.guild!, sessionId, interaction.user.id, isAdminInteraction(interaction));
+      const result = await cancelCrazyPostSession(context.guild, sessionId, interaction.user.id, isAdminMember(context.member));
       await interaction.editReply(result);
       return;
     }

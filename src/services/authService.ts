@@ -7,6 +7,10 @@ export function isAdminInteraction(interaction: ChatInputCommandInteraction | In
   }
 
   const member = interaction.member as GuildMember;
+  return isAdminMember(member);
+}
+
+export function isAdminMember(member: GuildMember): boolean {
   if (member.permissions.has(PermissionFlagsBits.ManageGuild)) {
     return true;
   }

@@ -13,6 +13,7 @@ import {
   startMeetingVoting
 } from "./services/gameService";
 import { logger } from "./utils/logger";
+import { allowedGuildIds, ensureGuildAllowed, isGuildAllowed } from "./services/guildAccessService";
 
 const panelLogger = logger.scoped("WebPanel");
 
@@ -30,42 +31,44 @@ export function startWebPanel(client: Client): void {
 
   publicApp.get("/", (_request, response) => response.type("html").send(publicPanelHtml()));
   publicApp.get("/panel", (_request, response) => response.type("html").send(publicPanelHtml()));
+  publicApp.get("/guild/:guildId/panel", (_request, response) => response.type("html").send(publicPanelHtml()));
 
-  publicApp.get("/api/session/status", async (_request, response) => {
-    await respond(response, async () => getPublicWebPanelStatus());
+  publicApp.get(["/api/session/status", "/guild/:guildId/api/session/status"], async (request, response) => {
+    await respond(response, async () => getPublicWebPanelStatus(resolvePanelGuildId(paramString(request.params.guildId))));
   });
 
-  publicApp.post("/api/emergency/start", async (_request, response) => {
+  publicApp.post(["/api/emergency/start", "/guild/:guildId/api/emergency/start"], async (request, response) => {
     await respond(response, async () => {
-      const guild = await activeGuild(client);
+      const guild = await activeGuild(client, resolvePanelGuildId(paramString(request.params.guildId)));
       await startEmergencyMeetingFromWeb(guild);
       return { ok: true };
     });
   });
 
-  publicApp.post("/api/meeting/start-discussion", async (_request, response) => {
+  publicApp.post(["/api/meeting/start-discussion", "/guild/:guildId/api/meeting/start-discussion"], async (request, response) => {
     await respond(response, async () => {
-      const guild = await activeGuild(client);
+      const guild = await activeGuild(client, resolvePanelGuildId(paramString(request.params.guildId)));
       await startMeetingDiscussion(guild);
       return { ok: true };
     });
   });
 
-  publicApp.post("/api/meeting/start-voting", async (_request, response) => {
+  publicApp.post(["/api/meeting/start-voting", "/guild/:guildId/api/meeting/start-voting"], async (request, response) => {
     await respond(response, async () => {
-      const guild = await activeGuild(client);
+      const guild = await activeGuild(client, resolvePanelGuildId(paramString(request.params.guildId)));
       await startMeetingVoting(guild);
       return { ok: true };
     });
   });
 
-  publicApp.post("/api/meeting/evaluate-voting", async (_request, response) => {
+  publicApp.post(["/api/meeting/evaluate-voting", "/guild/:guildId/api/meeting/evaluate-voting"], async (request, response) => {
     await respond(response, async () => {
-      const session = await getLatestActiveSession();
+      const guildId = resolvePanelGuildId(paramString(request.params.guildId));
+      const session = await getLatestActiveSession(guildId);
       if (!session) {
         throw new Error("Keine aktive Session gefunden.");
       }
-      const guild = await activeGuild(client);
+      const guild = await activeGuild(client, guildId);
       const message = await evaluateVoting(guild, session.id);
       return { ok: true, message };
     });
@@ -89,42 +92,44 @@ export function startWebPanel(client: Client): void {
   adminApp.get("/", (_request, response) => response.type("html").send(adminPanelHtml()));
   adminApp.get("/admin", (_request, response) => response.type("html").send(adminPanelHtml()));
   adminApp.get("/panel/admin", (_request, response) => response.type("html").send(adminPanelHtml()));
+  adminApp.get("/guild/:guildId/admin", (_request, response) => response.type("html").send(adminPanelHtml()));
 
-  adminApp.get("/api/admin/status", async (_request, response) => {
-    await respond(response, async () => getAdminPanelStatus());
+  adminApp.get(["/api/admin/status", "/guild/:guildId/api/admin/status"], async (request, response) => {
+    await respond(response, async () => getAdminPanelStatus(resolvePanelGuildId(paramString(request.params.guildId))));
   });
 
-  adminApp.post("/api/admin/meeting/start-discussion", async (_request, response) => {
+  adminApp.post(["/api/admin/meeting/start-discussion", "/guild/:guildId/api/admin/meeting/start-discussion"], async (request, response) => {
     await respond(response, async () => {
-      const guild = await activeGuild(client);
+      const guild = await activeGuild(client, resolvePanelGuildId(paramString(request.params.guildId)));
       await startMeetingDiscussion(guild);
       return { ok: true };
     });
   });
 
-  adminApp.post("/api/admin/meeting/start-voting", async (_request, response) => {
+  adminApp.post(["/api/admin/meeting/start-voting", "/guild/:guildId/api/admin/meeting/start-voting"], async (request, response) => {
     await respond(response, async () => {
-      const guild = await activeGuild(client);
+      const guild = await activeGuild(client, resolvePanelGuildId(paramString(request.params.guildId)));
       await startMeetingVoting(guild);
       return { ok: true };
     });
   });
 
-  adminApp.post("/api/admin/meeting/evaluate-voting", async (_request, response) => {
+  adminApp.post(["/api/admin/meeting/evaluate-voting", "/guild/:guildId/api/admin/meeting/evaluate-voting"], async (request, response) => {
     await respond(response, async () => {
-      const session = await getLatestActiveSession();
+      const guildId = resolvePanelGuildId(paramString(request.params.guildId));
+      const session = await getLatestActiveSession(guildId);
       if (!session) {
         throw new Error("Keine aktive Session gefunden.");
       }
-      const guild = await activeGuild(client);
+      const guild = await activeGuild(client, guildId);
       const message = await evaluateVoting(guild, session.id);
       return { ok: true, message };
     });
   });
 
-  adminApp.post("/api/admin/player/kick", async (request, response) => {
+  adminApp.post(["/api/admin/player/kick", "/guild/:guildId/api/admin/player/kick"], async (request, response) => {
     await respond(response, async () => {
-      const guild = await activeGuild(client);
+      const guild = await activeGuild(client, resolvePanelGuildId(paramString(request.params.guildId)));
       const playerId = String(request.body?.player_id || "");
       if (!playerId) {
         throw new Error("player_id fehlt.");
@@ -134,13 +139,14 @@ export function startWebPanel(client: Client): void {
     });
   });
 
-  adminApp.post("/api/admin/session/end", async (_request, response) => {
+  adminApp.post(["/api/admin/session/end", "/guild/:guildId/api/admin/session/end"], async (request, response) => {
     await respond(response, async () => {
-      const session = await getLatestActiveSession();
+      const guildId = resolvePanelGuildId(paramString(request.params.guildId));
+      const session = await getLatestActiveSession(guildId);
       if (!session) {
         throw new Error("Keine aktive Session gefunden.");
       }
-      const guild = await activeGuild(client);
+      const guild = await activeGuild(client, guildId);
       await endSession(guild, session.id);
       return { ok: true, message: `Session ${session.id} wurde beendet.` };
     });
@@ -159,8 +165,26 @@ async function respond(response: Response, action: () => Promise<object>): Promi
   }
 }
 
-async function activeGuild(client: Client): Promise<Guild> {
-  const session = await getLatestActiveSession();
+function resolvePanelGuildId(guildId: string | undefined): string {
+  if (guildId) {
+    return ensureGuildAllowed(guildId);
+  }
+  const allowed = allowedGuildIds();
+  if (allowed.length === 1 || config.singleGuildMode) {
+    const selected = allowed[0];
+    if (selected && isGuildAllowed(selected)) {
+      return selected;
+    }
+  }
+  throw new Error("Bitte eine Guild in der URL verwenden, z.B. /guild/<guildId>/panel.");
+}
+
+function paramString(value: string | string[] | undefined): string | undefined {
+  return Array.isArray(value) ? value[0] : value;
+}
+
+async function activeGuild(client: Client, guildId: string): Promise<Guild> {
+  const session = await getLatestActiveSession(guildId);
   if (!session) {
     throw new Error("Keine aktive Session gefunden.");
   }
@@ -251,10 +275,11 @@ function publicPanelHtml(): string {
   <script>
   let currentStatus = null;
   document.getElementById("refresh").onclick = loadStatus;
-  bind("startEmergency", () => post("/api/emergency/start"));
-  bind("startDiscussion", () => post("/api/meeting/start-discussion"));
-  bind("startVoting", () => post("/api/meeting/start-voting"));
-  bind("evaluateVoting", () => post("/api/meeting/evaluate-voting"));
+  const apiBase = location.pathname.startsWith("/guild/") ? location.pathname.split("/").slice(0, 3).join("/") : "";
+  bind("startEmergency", () => post(apiBase + "/api/emergency/start"));
+  bind("startDiscussion", () => post(apiBase + "/api/meeting/start-discussion"));
+  bind("startVoting", () => post(apiBase + "/api/meeting/start-voting"));
+  bind("evaluateVoting", () => post(apiBase + "/api/meeting/evaluate-voting"));
   function bind(id, fn) { const element = document.getElementById(id); if (element) element.onclick = fn; }
   async function post(url) {
     const response = await fetch(url, { method: "POST", headers: { "content-type": "application/json" }, body: "{}" });
@@ -263,7 +288,7 @@ function publicPanelHtml(): string {
     await loadStatus();
   }
   async function loadStatus() {
-    const response = await fetch("/api/session/status");
+    const response = await fetch(apiBase + "/api/session/status");
     currentStatus = await response.json();
     render(currentStatus);
   }
@@ -378,10 +403,11 @@ function adminPanelHtml(): string {
   <script>
   let currentStatus = null;
   document.getElementById("refresh").onclick = loadStatus;
-  bind("startDiscussion", () => post("/api/admin/meeting/start-discussion"));
-  bind("startVoting", () => post("/api/admin/meeting/start-voting"));
-  bind("evaluateVoting", () => post("/api/admin/meeting/evaluate-voting"));
-  bind("endSession", () => post("/api/admin/session/end"));
+  const apiBase = location.pathname.startsWith("/guild/") ? location.pathname.split("/").slice(0, 3).join("/") : "";
+  bind("startDiscussion", () => post(apiBase + "/api/admin/meeting/start-discussion"));
+  bind("startVoting", () => post(apiBase + "/api/admin/meeting/start-voting"));
+  bind("evaluateVoting", () => post(apiBase + "/api/admin/meeting/evaluate-voting"));
+  bind("endSession", () => post(apiBase + "/api/admin/session/end"));
   function bind(id, fn) { const element = document.getElementById(id); if (element) element.onclick = fn; }
   async function post(url, body = {}) {
     const response = await fetch(url, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
@@ -390,7 +416,7 @@ function adminPanelHtml(): string {
     await loadStatus();
   }
   async function loadStatus() {
-    const response = await fetch("/api/admin/status");
+    const response = await fetch(apiBase + "/api/admin/status");
     const data = await response.json();
     currentStatus = data;
     render(data);
@@ -416,7 +442,7 @@ function adminPanelHtml(): string {
       "<tr><td>" + escapeHtml(player.username) + (player.isGhost ? " (Ghost)" : "") + "</td><td>" + (player.role || "-") + "</td><td>" + player.state + "</td><td>" + player.tasks.done + "/" + player.tasks.total + "</td><td><button class='danger' data-player='" + escapeHtml(player.userId) + "'" + (player.state === "removed" || !data.active ? " disabled" : "") + ">Kicken</button></td></tr>"
     ).join("");
     document.querySelectorAll("button[data-player]").forEach(button => {
-      button.onclick = () => post("/api/admin/player/kick", { player_id: button.getAttribute("data-player") });
+      button.onclick = () => post(apiBase + "/api/admin/player/kick", { player_id: button.getAttribute("data-player") });
     });
     show(data.active ? "Adminpanel bereit." : (data.message || "Session beendet."), true);
   }

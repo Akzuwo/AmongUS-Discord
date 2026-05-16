@@ -73,7 +73,7 @@ export async function createGameSession(
   options: { isDebugSession?: boolean; ghostCount?: number } = {}
 ): Promise<GameSession> {
   validateMeetingTimes(meetingTimes);
-  const active = await getAnyActiveSession();
+  const active = await getAnyActiveSession(guild.id);
   if (active) {
     throw new Error(`Es gibt bereits eine aktive Session: ${active.id}`);
   }
@@ -151,6 +151,7 @@ export async function joinSession(guild: Guild, sessionId: number, member: Guild
 
 export async function startGame(guild: Guild, sessionId: number): Promise<void> {
   const session = await requireSession(sessionId);
+  assertSessionGuild(session, guild);
   if (session.gameType !== "amongus") {
     throw new Error("Diese Session ist keine Among-Us-Session.");
   }
@@ -201,10 +202,13 @@ export async function startGame(guild: Guild, sessionId: number): Promise<void> 
   await sendAdminStatus(guild, session.id);
 }
 
-export async function completeTask(guild: Guild, taskId: number, userId: string): Promise<PlayerTask> {
+export async function completeTask(guild: Guild, taskId: number, userId: string, expectedSessionId?: number): Promise<PlayerTask> {
   const existing = await getTaskById(taskId);
   if (!existing) {
     throw new Error("Task nicht gefunden.");
+  }
+  if (expectedSessionId !== undefined && existing.sessionId !== expectedSessionId) {
+    throw new Error("Diese Session existiert nicht mehr oder gehoert zu einem anderen Server.");
   }
   if (existing.steps.length > 0) {
     throw new Error("Dieser Task hat mehrere Steps. Bitte erledige die Steps einzeln.");
@@ -214,6 +218,7 @@ export async function completeTask(guild: Guild, taskId: number, userId: string)
   }
 
   const session = await requirePlayingSession(existing.sessionId);
+  assertSessionGuild(session, guild);
   const player = await getPlayer(session.id, userId);
   if (!player) {
     throw new Error("Du bist nicht mehr Teil dieser Session.");
@@ -248,6 +253,7 @@ export async function completeTaskStep(
   if (!existing || !step || step.assignedTaskId !== taskId || existing.sessionId !== sessionId || !session || session.status !== "playing") {
     throw new Error("Diese Session ist nicht mehr aktiv.");
   }
+  assertSessionGuild(session, guild);
 
   const player = await getPlayer(session.id, userId);
   if (!player || player.state === "removed") {
@@ -284,6 +290,7 @@ export async function completeTaskStep(
 
 export async function killSelectMenu(guild: Guild, sessionId: number, impostorId: string): Promise<StringSelectMenuBuilder> {
   const session = await requirePlayingSession(sessionId);
+  assertSessionGuild(session, guild);
   const impostor = await getPlayer(session.id, impostorId);
   if (!impostor || impostor.state === "removed") {
     throw new Error("Du bist nicht mehr Teil dieser Session.");
@@ -299,13 +306,14 @@ export async function killSelectMenu(guild: Guild, sessionId: number, impostorId
   }
 
   return new StringSelectMenuBuilder()
-    .setCustomId(ids.killSelect(session.id))
+    .setCustomId(ids.killSelect(session.guildId, session.id))
     .setPlaceholder("Getoeteten Crewmate auswaehlen")
     .addOptions(targets.slice(0, 25).map((player) => new StringSelectMenuOptionBuilder().setLabel(player.username).setValue(player.userId)));
 }
 
 export async function reportKill(guild: Guild, sessionId: number, killerId: string, victimId: string): Promise<void> {
   const session = await requirePlayingSession(sessionId);
+  assertSessionGuild(session, guild);
   const killer = await getPlayer(session.id, killerId);
   const victim = await getPlayer(session.id, victimId);
   if (!killer || killer.state === "removed") {
@@ -335,6 +343,7 @@ export async function reportKill(guild: Guild, sessionId: number, killerId: stri
 
 export async function canOpenBodyReportModal(guild: Guild, sessionId: number, reporterId: string): Promise<boolean> {
   const session = await requirePlayingSession(sessionId);
+  assertSessionGuild(session, guild);
   const reporter = await getPlayer(session.id, reporterId);
   if (!reporter || reporter.state === "removed") {
     throw new Error("Du bist nicht mehr Teil dieser Session.");
@@ -347,6 +356,7 @@ export async function canOpenBodyReportModal(guild: Guild, sessionId: number, re
 
 export async function recordFalseBodyReport(guild: Guild, sessionId: number, reporterId: string): Promise<string> {
   const session = await requirePlayingSession(sessionId);
+  assertSessionGuild(session, guild);
   const reporter = await getPlayer(session.id, reporterId);
   if (!reporter || reporter.state === "removed") {
     throw new Error("Du bist nicht mehr Teil dieser Session.");
@@ -362,9 +372,9 @@ export async function recordFalseBodyReport(guild: Guild, sessionId: number, rep
   return "Du hast eine Leiche gemeldet, obwohl keine ungemeldete Leiche existiert. Verwarnung 1/2.";
 }
 
-export function reportBodyModal(sessionId: number): ModalBuilder {
+export function scopedReportBodyModal(guildId: string, sessionId: number): ModalBuilder {
   return new ModalBuilder()
-    .setCustomId(ids.reportBodyModal(sessionId))
+    .setCustomId(ids.reportBodyModal(guildId, sessionId))
     .setTitle("Leiche melden")
     .addComponents(
       new ActionRowBuilder<TextInputBuilder>().addComponents(
@@ -380,6 +390,7 @@ export function reportBodyModal(sessionId: number): ModalBuilder {
 
 export async function reportBody(guild: Guild, sessionId: number, reporterId: string, location: string): Promise<void> {
   const session = await requirePlayingSession(sessionId);
+  assertSessionGuild(session, guild);
   const reporter = await getPlayer(session.id, reporterId);
   if (!reporter || reporter.state === "removed") {
     throw new Error("Du bist nicht mehr Teil dieser Session.");
@@ -441,6 +452,7 @@ async function removePlayerForFalseReports(guild: Guild, session: GameSession, p
 
 export async function startAdminMeeting(guild: Guild, sessionId: number): Promise<void> {
   const session = await requirePlayingSession(sessionId);
+  assertSessionGuild(session, guild);
   await clearVotes(session.id);
   await setSessionStatus(session.id, "meeting");
   await setMeetingPhase(session.id, "called", { discussionStartedAt: null, votingStartedAt: null });
@@ -452,6 +464,7 @@ export async function startAdminMeeting(guild: Guild, sessionId: number): Promis
 
 export async function startEmergencyMeeting(guild: Guild, sessionId: number, userId: string): Promise<void> {
   const session = await requireSession(sessionId);
+  assertSessionGuild(session, guild);
   if (session.status === "ended" || session.status === "cancelled") {
     throw new Error("Diese Session ist bereits beendet.");
   }
@@ -486,6 +499,7 @@ export async function clearFalseReportWarningsForUser(guild: Guild, adminId: str
 
 export async function castVote(guild: Guild, sessionId: number, voterId: string, targetUserId: string): Promise<string> {
   const session = await requireSession(sessionId);
+  assertSessionGuild(session, guild);
   if (session.status === "ended" || session.status === "cancelled") {
     throw new Error("Diese Session ist bereits beendet.");
   }
@@ -561,7 +575,8 @@ export async function evaluateVoting(guild: Guild, sessionId: number): Promise<s
 }
 
 export async function startMeetingDiscussion(guild: Guild, sessionId?: number): Promise<void> {
-  const session = sessionId ? await requireSession(sessionId) : await requireLatestActiveSession();
+  const session = sessionId ? await requireSession(sessionId) : await requireLatestActiveSession(guild.id);
+  assertSessionGuild(session, guild);
   if (session.status !== "meeting" || session.meetingPhase !== "called") {
     throw new Error("Diskussion kann nur in der Meetingphase called gestartet werden.");
   }
@@ -578,7 +593,8 @@ export async function startMeetingDiscussion(guild: Guild, sessionId?: number): 
 }
 
 export async function startMeetingVoting(guild: Guild, sessionId?: number): Promise<void> {
-  const session = sessionId ? await requireSession(sessionId) : await requireLatestActiveSession();
+  const session = sessionId ? await requireSession(sessionId) : await requireLatestActiveSession(guild.id);
+  assertSessionGuild(session, guild);
   if (session.status !== "meeting" || (session.meetingPhase !== "discussion" && session.meetingPhase !== "called")) {
     throw new Error("Voting kann nur in einer laufenden oder aufgerufenen Meetingphase gestartet werden.");
   }
@@ -591,10 +607,7 @@ export async function startMeetingVoting(guild: Guild, sessionId?: number): Prom
 }
 
 export async function startEmergencyMeetingFromWeb(guild: Guild): Promise<void> {
-  const session = await requireLatestActiveSession();
-  if (session.guildId !== guild.id) {
-    throw new Error("Aktive Session gehoert nicht zu diesem Server.");
-  }
+  const session = await requireLatestActiveSession(guild.id);
   if (session.status !== "playing") {
     throw new Error("Gerade ist kein Emergency Meeting moeglich.");
   }
@@ -625,8 +638,8 @@ export async function sendAdminStatus(guild: Guild, sessionId: number, prefix?: 
   await admin.send({ embeds: [await statusEmbed(session)] });
 }
 
-export async function getPublicWebPanelStatus(): Promise<object> {
-  const session = await getLatestSession();
+export async function getPublicWebPanelStatus(guildId: string): Promise<object> {
+  const session = await getLatestSession(guildId);
   if (!session) {
     return { active: false, message: "Aktuell läuft keine Session." };
   }
@@ -677,8 +690,8 @@ export async function getPublicWebPanelStatus(): Promise<object> {
   };
 }
 
-export async function getAdminPanelStatus(): Promise<object> {
-  const session = await getLatestSession();
+export async function getAdminPanelStatus(guildId: string): Promise<object> {
+  const session = await getLatestSession(guildId);
   if (!session) {
     return { active: false, message: "Aktuell läuft keine Session." };
   }
@@ -748,6 +761,7 @@ export async function getAdminPanelStatus(): Promise<object> {
 
 export async function sendAdminControlsForSession(guild: Guild, sessionId: number): Promise<void> {
   const session = await requireSession(sessionId);
+  assertSessionGuild(session, guild);
   const admin = await getTextChannel(guild, session.adminChannelId);
   if (admin) {
     await sendAdminControls(admin, session);
@@ -760,6 +774,7 @@ export async function endSession(guild: Guild, sessionId: number): Promise<void>
 
 export async function cancelAndDeleteSession(guild: Guild, sessionId: number): Promise<string> {
   const session = await requireSession(sessionId);
+  assertSessionGuild(session, guild);
   if (session.status !== "ended") {
     await setSessionStatus(session.id, "cancelled");
   }
@@ -769,6 +784,7 @@ export async function cancelAndDeleteSession(guild: Guild, sessionId: number): P
 
 export async function deleteSessionChannels(guild: Guild, sessionId: number): Promise<string> {
   const session = await requireSession(sessionId);
+  assertSessionGuild(session, guild);
   const idsToDelete = [
     session.lobbyChannelId,
     session.meetingChannelId,
@@ -807,6 +823,7 @@ export async function deleteSessionChannels(guild: Guild, sessionId: number): Pr
 
 export async function refreshLobby(guild: Guild, sessionId: number): Promise<void> {
   const session = await requireSession(sessionId);
+  assertSessionGuild(session, guild);
   // Historisches DB-Feld: lobbyChannelId steht fachlich fuer den Anmeldekanal.
   const registration = await getTextChannel(guild, session.lobbyChannelId);
   if (!registration || !session.joinMessageId) {
@@ -918,7 +935,7 @@ export async function debugVote(guild: Guild, sessionId: number, voterIdentifier
 }
 
 export async function kickPlayerFromAdmin(guild: Guild, playerId: string): Promise<string> {
-  const session = await requireLatestActiveSession();
+  const session = await requireLatestActiveSession(guild.id);
   const player = await getPlayer(session.id, playerId);
   if (!player) {
     throw new Error("Spieler ist nicht Teil der aktiven Session.");
@@ -1016,6 +1033,7 @@ async function createGhostPlayers(sessionId: number, ghostCount: number): Promis
 
 async function finishSession(guild: Guild, sessionId: number, winner: Winner, reason: string): Promise<void> {
   const current = await requireSession(sessionId);
+  assertSessionGuild(current, guild);
   if (current.status === "ended") {
     return;
   }
@@ -1031,7 +1049,7 @@ async function finishSession(guild: Guild, sessionId: number, winner: Winner, re
       ? "Spiel beendet. Gewinner: nicht festgelegt."
       : `Spiel beendet. Die ${winner} haben gewonnen.`;
   const deleteRow = new ActionRowBuilder<ButtonBuilder>().addComponents(
-    new ButtonBuilder().setCustomId(ids.confirmEnd(session.id)).setLabel("Session aufraeumen").setStyle(ButtonStyle.Danger)
+    new ButtonBuilder().setCustomId(ids.confirmEnd(session.guildId, session.id)).setLabel("Session aufraeumen").setStyle(ButtonStyle.Danger)
   );
 
   await admin?.send({ content: endText, embeds: [embed], components: [deleteRow] });
@@ -1090,9 +1108,9 @@ async function sendVotingMessage(guild: Guild, sessionId: number, startedAt: num
   const players = (await getPlayers(sessionId)).filter((player) => player.state === "alive");
   const voteButtons = [
     ...players.map((player) =>
-      new ButtonBuilder().setCustomId(ids.vote(sessionId, player.userId)).setLabel(player.username.slice(0, 80)).setStyle(ButtonStyle.Secondary)
+      new ButtonBuilder().setCustomId(ids.vote(session.guildId, sessionId, player.userId)).setLabel(player.username.slice(0, 80)).setStyle(ButtonStyle.Secondary)
     ),
-    new ButtonBuilder().setCustomId(ids.skipVote(sessionId)).setLabel("Skip").setStyle(ButtonStyle.Primary)
+    new ButtonBuilder().setCustomId(ids.skipVote(session.guildId, sessionId)).setLabel("Skip").setStyle(ButtonStyle.Primary)
   ];
 
   await meeting.send({
@@ -1111,12 +1129,12 @@ async function sendPlayerStartMessage(channel: TextChannel, player: Player, task
   );
 
   for (const task of tasks) {
-    await channel.send(taskMessageOptions(task, player.role === "crewmate"));
+    await channel.send(taskMessageOptions(task, player.role === "crewmate", channel.guild.id));
   }
 
-  const actionButtons = [new ButtonBuilder().setCustomId(ids.reportBody(player.sessionId)).setLabel("Leiche melden").setStyle(ButtonStyle.Danger)];
+  const actionButtons = [new ButtonBuilder().setCustomId(ids.reportBody(channel.guild.id, player.sessionId)).setLabel("Leiche melden").setStyle(ButtonStyle.Danger)];
   if (player.role === "impostor") {
-    actionButtons.push(new ButtonBuilder().setCustomId(ids.killPlayer(player.sessionId)).setLabel("Kill melden").setStyle(ButtonStyle.Secondary));
+    actionButtons.push(new ButtonBuilder().setCustomId(ids.killPlayer(channel.guild.id, player.sessionId)).setLabel("Kill melden").setStyle(ButtonStyle.Secondary));
   }
 
   await channel.send({
@@ -1125,7 +1143,7 @@ async function sendPlayerStartMessage(channel: TextChannel, player: Player, task
   });
 }
 
-export function taskMessageOptions(task: PlayerTask, canComplete: boolean) {
+export function taskMessageOptions(task: PlayerTask, canComplete: boolean, guildId: string) {
   const content = task.steps.length > 0 ? multiStepTaskContent(task) : singleStepTaskContent(task);
   if (!canComplete) {
     return { content, components: [] };
@@ -1137,7 +1155,7 @@ export function taskMessageOptions(task: PlayerTask, canComplete: boolean) {
         ? []
         : [
             new ActionRowBuilder<ButtonBuilder>().addComponents(
-              new ButtonBuilder().setCustomId(ids.taskDone(task.id)).setLabel("Erledigt").setStyle(ButtonStyle.Success)
+              new ButtonBuilder().setCustomId(ids.taskDone(guildId, task.sessionId, task.id)).setLabel("Erledigt").setStyle(ButtonStyle.Success)
             )
           ]
     };
@@ -1145,7 +1163,7 @@ export function taskMessageOptions(task: PlayerTask, canComplete: boolean) {
 
   const buttons = task.steps.map((step, index) =>
     new ButtonBuilder()
-      .setCustomId(ids.taskStepDone(task.sessionId, task.id, step.id))
+      .setCustomId(ids.taskStepDone(guildId, task.sessionId, task.id, step.id))
       .setLabel(`Step ${index + 1} erledigt`)
       .setStyle(step.completed ? ButtonStyle.Secondary : ButtonStyle.Success)
       .setDisabled(task.completed || step.completed)
@@ -1290,9 +1308,9 @@ async function sendAdminControls(channel: TextChannel, session: GameSession): Pr
     content: "Admin-Controls",
     components: [
       new ActionRowBuilder<ButtonBuilder>().addComponents(
-        new ButtonBuilder().setCustomId(ids.deletePrompt(session.id)).setLabel("Session aufraeumen").setStyle(ButtonStyle.Danger),
-        new ButtonBuilder().setCustomId(ids.adminStatus(session.id)).setLabel("Status aktualisieren").setStyle(ButtonStyle.Secondary),
-        new ButtonBuilder().setCustomId(ids.start(session.id)).setLabel("Spiel starten").setStyle(ButtonStyle.Success)
+        new ButtonBuilder().setCustomId(ids.deletePrompt(session.guildId, session.id)).setLabel("Session aufraeumen").setStyle(ButtonStyle.Danger),
+        new ButtonBuilder().setCustomId(ids.adminStatus(session.guildId, session.id)).setLabel("Status aktualisieren").setStyle(ButtonStyle.Secondary),
+        new ButtonBuilder().setCustomId(ids.start(session.guildId, session.id)).setLabel("Spiel starten").setStyle(ButtonStyle.Success)
       )
     ]
   });
@@ -1565,11 +1583,11 @@ function formatClock(timestamp: number): string {
 }
 
 function joinButton(session: GameSession): ButtonBuilder {
-  return new ButtonBuilder().setCustomId(ids.join(session.id)).setLabel("Beitreten").setStyle(ButtonStyle.Primary);
+  return new ButtonBuilder().setCustomId(ids.join(session.guildId, session.id)).setLabel("Beitreten").setStyle(ButtonStyle.Primary);
 }
 
 function startButton(session: GameSession): ButtonBuilder {
-  return new ButtonBuilder().setCustomId(ids.start(session.id)).setLabel("Spiel starten").setStyle(ButtonStyle.Success);
+  return new ButtonBuilder().setCustomId(ids.start(session.guildId, session.id)).setLabel("Spiel starten").setStyle(ButtonStyle.Success);
 }
 
 function chunkButtons(buttons: ButtonBuilder[]): ActionRowBuilder<ButtonBuilder>[] {
@@ -1596,12 +1614,18 @@ async function requireSession(sessionId: number): Promise<GameSession> {
   return session;
 }
 
-async function requireLatestActiveSession(): Promise<GameSession> {
-  const session = await getLatestActiveSession();
+async function requireLatestActiveSession(guildId: string): Promise<GameSession> {
+  const session = await getLatestActiveSession(guildId);
   if (!session) {
     throw new Error("Keine aktive Session gefunden.");
   }
   return session;
+}
+
+function assertSessionGuild(session: GameSession, guild: Guild): void {
+  if (session.guildId !== guild.id) {
+    throw new Error("Diese Session existiert nicht mehr oder gehoert zu einem anderen Server.");
+  }
 }
 
 async function requireMutableSession(sessionId: number): Promise<GameSession> {

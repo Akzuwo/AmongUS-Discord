@@ -41,6 +41,7 @@ import {
 } from "../db/repository";
 import { CrazyPostOrderMode, GameSession, Player } from "../models/session";
 import { ids } from "../utils/customIds";
+import { messageGuildId } from "../utils/guildContext";
 import { logger } from "../utils/logger";
 
 const WAITING_TEXT =
@@ -53,7 +54,7 @@ export async function createCrazyPostGameSession(
   creator: GuildMember,
   orderMode: CrazyPostOrderMode
 ): Promise<GameSession> {
-  const active = await getAnyActiveSession();
+  const active = await getAnyActiveSession(guild.id);
   if (active) {
     throw new Error(`Es gibt bereits eine aktive Session: ${active.id}`);
   }
@@ -102,6 +103,7 @@ export async function joinCrazyPostSession(guild: Guild, sessionId: number, memb
 
 export async function startCrazyPostGame(guild: Guild, sessionId: number, userId: string, isAdmin: boolean): Promise<void> {
   const session = await requireCrazyPostSession(sessionId);
+  assertSessionGuild(session, guild);
   assertHostOrAdmin(session, userId, isAdmin, "Nur Host oder Spielleitung kann das Spiel starten.");
   if (session.status !== "lobby") {
     throw new Error("Die Session ist nicht in der Anmeldephase.");
@@ -144,11 +146,16 @@ export async function startCrazyPostGame(guild: Guild, sessionId: number, userId
 }
 
 export async function handleCrazyPostPlayerMessage(message: Message): Promise<boolean> {
-  if (!message.guild || message.author.bot || message.channel.type !== ChannelType.GuildText) {
+  const guildId = messageGuildId(message);
+  if (!guildId || message.author.bot || message.channel.type !== ChannelType.GuildText) {
+    return false;
+  }
+  const guild = message.guild ?? await message.client.guilds.fetch(guildId).catch(() => null);
+  if (!guild) {
     return false;
   }
 
-  const session = await getActiveCrazyPostSessionByChannel(message.channel.id);
+  const session = await getActiveCrazyPostSessionByChannel(guildId, message.channel.id);
   if (!session) {
     return false;
   }
@@ -172,33 +179,34 @@ export async function handleCrazyPostPlayerMessage(message: Message): Promise<bo
 
   const text = await getCrazyPostTextById(state.activeTextId);
   if (!text || text.finished || text.route[text.currentStepIndex] !== player.userId) {
-    await deleteActiveMessage(message.guild, player, state.activeMessageId);
+    await deleteActiveMessage(guild, player, state.activeMessageId);
     await setCrazyPostPlayerState(session.id, player.userId, { activeMessageId: null, activeTextId: null });
-    await releaseNextCrazyPostTask(message.guild, session.id, player.userId);
+    await releaseNextCrazyPostTask(guild, session.id, player.userId);
     return true;
   }
 
-  await deleteActiveMessage(message.guild, player, state.activeMessageId);
+  await deleteActiveMessage(guild, player, state.activeMessageId);
   await setCrazyPostPlayerState(session.id, player.userId, { activeMessageId: null, activeTextId: null });
   await message.delete().catch(() => null);
 
   await addCrazyPostSentence(text.id, player.userId, content);
   const nextStepIndex = text.currentStepIndex + 1;
   const finished = nextStepIndex >= text.route.length;
-  await logCrazyPostSubmission(message.guild, session, text.id, player, text.currentStepIndex, finished, content);
+  await logCrazyPostSubmission(guild, session, text.id, player, text.currentStepIndex, finished, content);
   await advanceCrazyPostText(text.id, nextStepIndex, finished);
 
   if (!finished) {
-    await queueOrSendCrazyPostTask(message.guild, session.id, text.route[nextStepIndex], text.id);
+    await queueOrSendCrazyPostTask(guild, session.id, text.route[nextStepIndex], text.id);
   }
 
-  await releaseNextCrazyPostTask(message.guild, session.id, player.userId);
-  await finishCrazyPostIfComplete(message.guild, session.id);
+  await releaseNextCrazyPostTask(guild, session.id, player.userId);
+  await finishCrazyPostIfComplete(guild, session.id);
   return true;
 }
 
 export async function cancelCrazyPostSession(guild: Guild, sessionId: number, userId: string, isAdmin: boolean): Promise<string> {
   const session = await requireCrazyPostSession(sessionId);
+  assertSessionGuild(session, guild);
   assertHostOrAdmin(session, userId, isAdmin, "Nur Host oder Spielleitung kann diese Session abbrechen.");
   if (session.status !== "ended") {
     await setSessionStatus(session.id, "cancelled");
@@ -209,6 +217,7 @@ export async function cancelCrazyPostSession(guild: Guild, sessionId: number, us
 
 export async function refreshCrazyPostLobby(guild: Guild, sessionId: number): Promise<void> {
   const session = await requireCrazyPostSession(sessionId);
+  assertSessionGuild(session, guild);
   const registration = await getTextChannel(guild, session.lobbyChannelId);
   if (!registration || !session.joinMessageId) {
     return;
@@ -332,6 +341,7 @@ async function sendCrazyPostTask(guild: Guild, sessionId: number, userId: string
 
 async function finishCrazyPostIfComplete(guild: Guild, sessionId: number): Promise<void> {
   const session = await requireCrazyPostSession(sessionId);
+  assertSessionGuild(session, guild);
   if (session.status !== "playing") {
     return;
   }
@@ -355,7 +365,7 @@ async function finishCrazyPostIfComplete(guild: Guild, sessionId: number): Promi
   const signup = await getTextChannel(guild, session.lobbyChannelId);
   const admin = await getTextChannel(guild, session.adminChannelId);
   const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
-    new ButtonBuilder().setCustomId(ids.crazyPostDelete(session.id)).setLabel("Session aufraeumen").setStyle(ButtonStyle.Danger)
+    new ButtonBuilder().setCustomId(ids.crazyPostDelete(session.guildId, session.id)).setLabel("Session aufraeumen").setStyle(ButtonStyle.Danger)
   );
   await signup?.send("Verrueckte Post ist fertig. Alle Spieler haben ihren vollstaendigen Text erhalten.").catch(() => null);
   await admin?.send({ content: "Verrueckte-Post-Session beendet.", components: [row] }).catch(() => null);
@@ -483,6 +493,7 @@ async function logCrazyPostFinalTexts(guild: Guild, sessionId: number, textIds: 
 
 async function deleteCrazyPostChannels(guild: Guild, sessionId: number): Promise<string> {
   const session = await requireCrazyPostSession(sessionId);
+  assertSessionGuild(session, guild);
   const protectedIds = new Set(
     [
       await findTextChannelIdByName(guild, TEXT_COLLECTION_CHANNEL_NAME)
@@ -621,23 +632,23 @@ async function sendCrazyPostAdminControls(channel: TextChannel, session: GameSes
     content: "Admin-Controls",
     components: [
       new ActionRowBuilder<ButtonBuilder>().addComponents(
-        new ButtonBuilder().setCustomId(ids.crazyPostDelete(session.id)).setLabel("Session aufraeumen").setStyle(ButtonStyle.Danger),
-        new ButtonBuilder().setCustomId(ids.crazyPostStart(session.id)).setLabel("Spiel starten").setStyle(ButtonStyle.Success)
+        new ButtonBuilder().setCustomId(ids.crazyPostDelete(session.guildId, session.id)).setLabel("Session aufraeumen").setStyle(ButtonStyle.Danger),
+        new ButtonBuilder().setCustomId(ids.crazyPostStart(session.guildId, session.id)).setLabel("Spiel starten").setStyle(ButtonStyle.Success)
       )
     ]
   });
 }
 
 function joinButton(session: GameSession): ButtonBuilder {
-  return new ButtonBuilder().setCustomId(ids.crazyPostJoin(session.id)).setLabel("Beitreten").setStyle(ButtonStyle.Primary);
+  return new ButtonBuilder().setCustomId(ids.crazyPostJoin(session.guildId, session.id)).setLabel("Beitreten").setStyle(ButtonStyle.Primary);
 }
 
 function startButton(session: GameSession): ButtonBuilder {
-  return new ButtonBuilder().setCustomId(ids.crazyPostStart(session.id)).setLabel("Spiel starten").setStyle(ButtonStyle.Success);
+  return new ButtonBuilder().setCustomId(ids.crazyPostStart(session.guildId, session.id)).setLabel("Spiel starten").setStyle(ButtonStyle.Success);
 }
 
 function cancelButton(session: GameSession): ButtonBuilder {
-  return new ButtonBuilder().setCustomId(ids.crazyPostDelete(session.id)).setLabel("Abbrechen").setStyle(ButtonStyle.Danger);
+  return new ButtonBuilder().setCustomId(ids.crazyPostDelete(session.guildId, session.id)).setLabel("Abbrechen").setStyle(ButtonStyle.Danger);
 }
 
 function normalizeSentence(value: string): string {
@@ -769,6 +780,12 @@ async function requireCrazyPostSession(sessionId: number): Promise<GameSession> 
     throw new Error("Diese Session ist keine Verrueckte-Post-Session.");
   }
   return session;
+}
+
+function assertSessionGuild(session: GameSession, guild: Guild): void {
+  if (session.guildId !== guild.id) {
+    throw new Error("Diese Session existiert nicht mehr oder gehoert zu einem anderen Server.");
+  }
 }
 
 function safeChannelName(value: string): string {

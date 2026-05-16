@@ -47,9 +47,10 @@ import {
 } from "../db/repository";
 import { FragwuerdigAnswerType, FragwuerdigQuestionPair, FragwuerdigRound, GameSession, Player } from "../models/session";
 import { ids } from "../utils/customIds";
+import { messageGuildId } from "../utils/guildContext";
 
 export async function createFragwuerdigGameSession(guild: Guild, creator: GuildMember, impostorCount: 1 | 2): Promise<GameSession> {
-  const active = await getAnyActiveSession();
+  const active = await getAnyActiveSession(guild.id);
   if (active) {
     throw new Error(`Es gibt bereits eine aktive Session: ${active.id}`);
   }
@@ -102,6 +103,7 @@ export async function joinFragwuerdigSession(guild: Guild, sessionId: number, me
 
 export async function startFragwuerdigRound(guild: Guild, sessionId: number, userId: string, isAdmin: boolean): Promise<void> {
   const session = await requireFragwuerdigSession(sessionId);
+  assertSessionGuild(session, guild);
   assertHostOrAdmin(session, userId, isAdmin, "Nur Host oder Spielleitung kann die Runde starten.");
   if (!["lobby", "round_finished"].includes(session.status)) {
     throw new Error("Gerade kann keine neue Fragwuerdig-Runde gestartet werden.");
@@ -150,11 +152,16 @@ export async function startFragwuerdigRound(guild: Guild, sessionId: number, use
 }
 
 export async function handleFragwuerdigPlayerMessage(message: Message): Promise<boolean> {
-  if (!message.guild || message.author.bot || message.channel.type !== ChannelType.GuildText) {
+  const guildId = messageGuildId(message);
+  if (!guildId || message.author.bot || message.channel.type !== ChannelType.GuildText) {
+    return false;
+  }
+  const guild = message.guild ?? await message.client.guilds.fetch(guildId).catch(() => null);
+  if (!guild) {
     return false;
   }
 
-  const session = await getActiveFragwuerdigSessionByChannel(message.channel.id);
+  const session = await getActiveFragwuerdigSessionByChannel(guildId, message.channel.id);
   if (!session || session.status !== "answering") {
     return false;
   }
@@ -180,7 +187,7 @@ export async function handleFragwuerdigPlayerMessage(message: Message): Promise<
     return true;
   }
 
-  await deleteActivePlayerMessage(message.guild, player, playerState.activeMessageId);
+  await deleteActivePlayerMessage(guild, player, playerState.activeMessageId);
   await message.delete().catch(() => null);
   const stored = await addFragwuerdigAnswer(round.id, player.userId, normalized.value);
   if (!stored) {
@@ -190,17 +197,19 @@ export async function handleFragwuerdigPlayerMessage(message: Message): Promise<
   const saved = await (message.channel as TextChannel).send("Antwort gespeichert. Warte auf die anderen Spieler.");
   await setFragwuerdigPlayerActiveMessage(session.id, player.userId, saved.id);
 
-  await maybeStartVoting(message.guild, session.id, round.id);
+  await maybeStartVoting(guild, session.id, round.id);
   return true;
 }
 
 export async function recordFragwuerdigVote(
   interaction: StringSelectMenuInteraction,
+  guild: Guild,
   sessionId: number,
   roundId: number,
   targetPlayerIds: string[]
 ): Promise<string> {
   const session = await requireFragwuerdigSession(sessionId);
+  assertSessionGuild(session, guild);
   if (session.status !== "voting") {
     throw new Error("Aktuell laeuft kein Fragwuerdig-Voting.");
   }
@@ -226,7 +235,7 @@ export async function recordFragwuerdigVote(
 
   const votes = await getFragwuerdigVotes(round.id);
   if (votes.length >= activePlayers.length) {
-    await revealFragwuerdigRound(interaction.guild!, session, round);
+    await revealFragwuerdigRound(guild, session, round);
     return "Stimme gespeichert. Alle Stimmen sind da.";
   }
   return `Stimme gespeichert (${votes.length}/${activePlayers.length}).`;
@@ -234,6 +243,7 @@ export async function recordFragwuerdigVote(
 
 export async function markFragwuerdigContinue(guild: Guild, sessionId: number, userId: string, wantsToContinue: boolean): Promise<string> {
   const session = await requireFragwuerdigSession(sessionId);
+  assertSessionGuild(session, guild);
   if (session.status !== "round_finished") {
     throw new Error("Diese Entscheidung ist gerade nicht aktiv.");
   }
@@ -251,12 +261,14 @@ export async function markFragwuerdigContinue(guild: Guild, sessionId: number, u
 
 export async function endFragwuerdigByHost(guild: Guild, sessionId: number, userId: string, isAdmin: boolean): Promise<string> {
   const session = await requireFragwuerdigSession(sessionId);
+  assertSessionGuild(session, guild);
   assertHostOrAdmin(session, userId, isAdmin, "Nur Host oder Spielleitung kann diese Session beenden.");
   return finishFragwuerdigSession(guild, session.id, "Session wurde beendet.");
 }
 
 export async function refreshFragwuerdigLobby(guild: Guild, sessionId: number): Promise<void> {
   const session = await requireFragwuerdigSession(sessionId);
+  assertSessionGuild(session, guild);
   const registration = await getTextChannel(guild, session.lobbyChannelId);
   if (!registration || !session.joinMessageId) {
     return;
@@ -270,6 +282,7 @@ export async function refreshFragwuerdigLobby(guild: Guild, sessionId: number): 
 
 async function maybeStartVoting(guild: Guild, sessionId: number, roundId: number): Promise<void> {
   const session = await requireFragwuerdigSession(sessionId);
+  assertSessionGuild(session, guild);
   const round = await getCurrentFragwuerdigRound(sessionId);
   if (!round || round.id !== roundId || round.status !== "answering") {
     return;
@@ -305,7 +318,7 @@ async function maybeStartVoting(guild: Guild, sessionId: number, roundId: number
       "Stimmt jetzt ab:",
       "Wer hatte eine andere Frage?"
     ].join("\n"),
-    components: [voteSelectRow(session.id, round, activePlayers)]
+    components: [voteSelectRow(session.guildId, session.id, round, activePlayers)]
   });
 }
 
@@ -346,13 +359,14 @@ async function revealFragwuerdigRound(guild: Guild, session: GameSession, round:
       "",
       groupFound ? "Die Gruppe hat den Impostor gefunden." : "Die Gruppe hat den Impostor nicht eindeutig gefunden."
     ].join("\n"),
-    components: [roundDecisionRow(session.id), hostDecisionRow(session.id)]
+    components: [roundDecisionRow(session.guildId, session.id), hostDecisionRow(session.guildId, session.id)]
   });
   await refreshFragwuerdigLobby(guild, session.id);
 }
 
 async function finishFragwuerdigSession(guild: Guild, sessionId: number, reason: string): Promise<string> {
   const session = await requireFragwuerdigSession(sessionId);
+  assertSessionGuild(session, guild);
   if (session.status === "finished") {
     return deleteFragwuerdigChannels(guild, session.id);
   }
@@ -375,6 +389,7 @@ async function finishFragwuerdigSession(guild: Guild, sessionId: number, reason:
 
 async function deleteFragwuerdigChannels(guild: Guild, sessionId: number, players?: Player[]): Promise<string> {
   const session = await requireFragwuerdigSession(sessionId);
+  assertSessionGuild(session, guild);
   const sessionPlayers = players ?? await getPlayers(session.id);
   const idsToDelete = [
     session.lobbyChannelId,
@@ -491,11 +506,11 @@ function nextUsedQuestionIds(usedIds: string[], questionPairId: string): string[
   return [...new Set(next)];
 }
 
-function voteSelectRow(sessionId: number, round: FragwuerdigRound, players: Player[]): ActionRowBuilder<StringSelectMenuBuilder> {
+function voteSelectRow(guildId: string, sessionId: number, round: FragwuerdigRound, players: Player[]): ActionRowBuilder<StringSelectMenuBuilder> {
   const impostorCount = round.impostorIds.length;
   return new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(
     new StringSelectMenuBuilder()
-      .setCustomId(ids.fragwuerdigVote(sessionId, round.id))
+      .setCustomId(ids.fragwuerdigVote(guildId, sessionId, round.id))
       .setPlaceholder(impostorCount === 1 ? "Wer hatte eine andere Frage?" : "Wer hatte andere Fragen?")
       .setMinValues(impostorCount)
       .setMaxValues(impostorCount)
@@ -505,23 +520,23 @@ function voteSelectRow(sessionId: number, round: FragwuerdigRound, players: Play
 
 function lobbyButtonRow(session: GameSession): ActionRowBuilder<ButtonBuilder> {
   return new ActionRowBuilder<ButtonBuilder>().addComponents(
-    new ButtonBuilder().setCustomId(ids.fragwuerdigJoin(session.id)).setLabel("Beitreten").setStyle(ButtonStyle.Primary),
-    new ButtonBuilder().setCustomId(ids.fragwuerdigStart(session.id)).setLabel("Spiel starten").setStyle(ButtonStyle.Success),
-    new ButtonBuilder().setCustomId(ids.fragwuerdigCancel(session.id)).setLabel("Abbrechen").setStyle(ButtonStyle.Danger)
+    new ButtonBuilder().setCustomId(ids.fragwuerdigJoin(session.guildId, session.id)).setLabel("Beitreten").setStyle(ButtonStyle.Primary),
+    new ButtonBuilder().setCustomId(ids.fragwuerdigStart(session.guildId, session.id)).setLabel("Spiel starten").setStyle(ButtonStyle.Success),
+    new ButtonBuilder().setCustomId(ids.fragwuerdigCancel(session.guildId, session.id)).setLabel("Abbrechen").setStyle(ButtonStyle.Danger)
   );
 }
 
-function roundDecisionRow(sessionId: number): ActionRowBuilder<ButtonBuilder> {
+function roundDecisionRow(guildId: string, sessionId: number): ActionRowBuilder<ButtonBuilder> {
   return new ActionRowBuilder<ButtonBuilder>().addComponents(
-    new ButtonBuilder().setCustomId(ids.fragwuerdigContinue(sessionId)).setLabel("Weiterspielen").setStyle(ButtonStyle.Success),
-    new ButtonBuilder().setCustomId(ids.fragwuerdigStop(sessionId)).setLabel("Aufhoeren").setStyle(ButtonStyle.Secondary)
+    new ButtonBuilder().setCustomId(ids.fragwuerdigContinue(guildId, sessionId)).setLabel("Weiterspielen").setStyle(ButtonStyle.Success),
+    new ButtonBuilder().setCustomId(ids.fragwuerdigStop(guildId, sessionId)).setLabel("Aufhoeren").setStyle(ButtonStyle.Secondary)
   );
 }
 
-function hostDecisionRow(sessionId: number): ActionRowBuilder<ButtonBuilder> {
+function hostDecisionRow(guildId: string, sessionId: number): ActionRowBuilder<ButtonBuilder> {
   return new ActionRowBuilder<ButtonBuilder>().addComponents(
-    new ButtonBuilder().setCustomId(ids.fragwuerdigNextRound(sessionId)).setLabel("Naechste Runde starten").setStyle(ButtonStyle.Primary),
-    new ButtonBuilder().setCustomId(ids.fragwuerdigEnd(sessionId)).setLabel("Session beenden").setStyle(ButtonStyle.Danger)
+    new ButtonBuilder().setCustomId(ids.fragwuerdigNextRound(guildId, sessionId)).setLabel("Naechste Runde starten").setStyle(ButtonStyle.Primary),
+    new ButtonBuilder().setCustomId(ids.fragwuerdigEnd(guildId, sessionId)).setLabel("Session beenden").setStyle(ButtonStyle.Danger)
   );
 }
 
@@ -579,8 +594,8 @@ async function sendFragwuerdigAdminControls(channel: TextChannel, session: GameS
   await channel.send({
     content: "Admin-Controls",
     components: [new ActionRowBuilder<ButtonBuilder>().addComponents(
-      new ButtonBuilder().setCustomId(ids.fragwuerdigStart(session.id)).setLabel("Spiel starten").setStyle(ButtonStyle.Success),
-      new ButtonBuilder().setCustomId(ids.fragwuerdigEnd(session.id)).setLabel("Session beenden").setStyle(ButtonStyle.Danger)
+      new ButtonBuilder().setCustomId(ids.fragwuerdigStart(session.guildId, session.id)).setLabel("Spiel starten").setStyle(ButtonStyle.Success),
+      new ButtonBuilder().setCustomId(ids.fragwuerdigEnd(session.guildId, session.id)).setLabel("Session beenden").setStyle(ButtonStyle.Danger)
     )]
   });
 }
@@ -719,6 +734,12 @@ async function requireFragwuerdigSession(sessionId: number): Promise<GameSession
     throw new Error("Diese Session ist keine Fragwuerdig-Session.");
   }
   return session;
+}
+
+function assertSessionGuild(session: GameSession, guild: Guild): void {
+  if (session.guildId !== guild.id) {
+    throw new Error("Diese Session existiert nicht mehr oder gehoert zu einem anderen Server.");
+  }
 }
 
 async function requireFragwuerdigSettings(sessionId: number) {

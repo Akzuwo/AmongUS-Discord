@@ -10,6 +10,13 @@ import { handleSelect } from "./interactions/selectHandler";
 import { registerCommands } from "./services/commandRegistry";
 import { handleCrazyPostPlayerMessage } from "./services/crazyPostService";
 import { handleFragwuerdigPlayerMessage } from "./services/fragwuerdigService";
+import {
+  isGuildAllowed,
+  logGuildAccessConfiguration,
+  prepareAllowedGuildStorage,
+  warnAboutLegacyGlobalJsonStorage
+} from "./services/guildAccessService";
+import { interactionGuildId, logBlockedInteraction, logBlockedMessage, messageGuildId } from "./utils/guildContext";
 import { isExpectedInteractionError, safeReply } from "./utils/interactionResponses";
 import { logger } from "./utils/logger";
 import { startWebPanel } from "./webPanel";
@@ -18,6 +25,9 @@ const appLogger = logger.scoped("App");
 
 async function main(): Promise<void> {
   appLogger.info("Botstart initialisiert.", { debugMode: config.debugMode, webPanelEnabled: config.webPanelEnabled });
+  logGuildAccessConfiguration();
+  prepareAllowedGuildStorage();
+  warnAboutLegacyGlobalJsonStorage();
   await initDb();
 
   const client = new Client({
@@ -37,6 +47,15 @@ async function main(): Promise<void> {
 
   client.on(Events.InteractionCreate, async (interaction) => {
     try {
+      const guildId = interactionGuildId(interaction);
+      if (guildId && !isGuildAllowed(guildId)) {
+        logBlockedInteraction(interaction, "Guild nicht erlaubt");
+        if (interaction.isRepliable()) {
+          await safeReply(interaction, "Dieser Server ist für diesen Bot nicht freigeschaltet.");
+        }
+        return;
+      }
+
       if (interaction.isChatInputCommand() && interaction.commandName === "amongus") {
         appLogger.debug("Slash Command ausgefuehrt.", { subcommand: interaction.options.getSubcommand(), userId: interaction.user.id });
         await handleAmongUsCommand(interaction);
@@ -78,6 +97,11 @@ async function main(): Promise<void> {
 
   client.on(Events.MessageCreate, async (message) => {
     try {
+      const guildId = messageGuildId(message);
+      if (guildId && !isGuildAllowed(guildId)) {
+        logBlockedMessage(message, "Guild nicht erlaubt");
+        return;
+      }
       if (await handleFragwuerdigPlayerMessage(message)) {
         return;
       }
