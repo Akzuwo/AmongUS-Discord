@@ -325,6 +325,7 @@ function shellHtml(title: string, body: string): string {
     textarea { width: 100%; min-height: 280px; padding: 10px; border: 1px solid var(--line); border-radius: 6px; font: inherit; }
     pre { white-space: pre-wrap; background: #f5efe7; border: 1px solid var(--line); border-radius: 6px; padding: 12px; overflow: auto; }
     .modal-backdrop { position: fixed; inset: 0; background: rgba(31, 27, 24, 0.45); display: flex; align-items: center; justify-content: center; padding: 18px; z-index: 10; }
+    .modal-backdrop.hidden { display: none; }
     .modal { max-width: 520px; background: var(--panel); border-radius: 8px; border: 1px solid var(--line); padding: 20px; box-shadow: 0 20px 60px rgba(0,0,0,0.24); }
     table { width: 100%; border-collapse: collapse; }
     th, td { padding: 8px; text-align: left; border-bottom: 1px solid #ebe3da; vertical-align: top; }
@@ -423,11 +424,22 @@ function adminPanelHtml(): string {
     const response = await fetch("/api/admin/reviews/crazy-post/pending-count");
     const data = await parseResponse(response);
     if (data.error) return;
+    const count = Number(data.count || 0);
     pendingReviewIds = data.reviewIds || [];
-    setText("reviewCount", "Reviews: " + data.count);
+    setText("reviewCount", "Reviews: " + count);
+    if (count === 0) {
+      dismissedReviewIds = [];
+      dismissedUntil = 0;
+      hideReviewModal();
+      return;
+    }
+    if (location.pathname.startsWith("/admin/reviews/crazy-post")) {
+      hideReviewModal();
+      return;
+    }
     const hasNew = pendingReviewIds.some(id => !dismissedReviewIds.includes(id));
-    if (data.count > 0 && Date.now() > dismissedUntil && (hasNew || dismissedReviewIds.length === 0) && !location.pathname.startsWith("/admin/reviews/crazy-post")) {
-      document.getElementById("reviewModalText").textContent = "Es gibt " + data.count + " neue Verrueckte-Post-Texte, die geprueft werden muessen.";
+    if (Date.now() > dismissedUntil && (hasNew || dismissedReviewIds.length === 0)) {
+      document.getElementById("reviewModalText").textContent = "Es gibt " + count + " neue Verrueckte-Post-Texte, die geprueft werden muessen.";
       document.getElementById("reviewModal").classList.remove("hidden");
     }
   }
