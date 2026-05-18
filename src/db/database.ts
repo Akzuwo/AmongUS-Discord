@@ -183,6 +183,28 @@ export async function initDb(): Promise<void> {
       FOREIGN KEY(text_id) REFERENCES crazy_post_texts(id) ON DELETE CASCADE
     );
 
+    CREATE TABLE IF NOT EXISTS crazy_post_reviews (
+      review_id TEXT PRIMARY KEY,
+      guild_id TEXT NOT NULL,
+      session_id INTEGER NOT NULL,
+      text_id INTEGER NOT NULL,
+      game_type TEXT NOT NULL DEFAULT 'crazy_post',
+      status TEXT NOT NULL DEFAULT 'pending_review',
+      original_text TEXT NOT NULL,
+      edited_text TEXT,
+      contributions_json TEXT NOT NULL DEFAULT '[]',
+      debug_session INTEGER NOT NULL DEFAULT 0,
+      rejected_at TEXT,
+      approved_at TEXT,
+      posted_at TEXT,
+      text_collection_message_id TEXT,
+      created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      UNIQUE(session_id, text_id),
+      FOREIGN KEY(session_id) REFERENCES sessions(id) ON DELETE CASCADE,
+      FOREIGN KEY(text_id) REFERENCES crazy_post_texts(id) ON DELETE CASCADE
+    );
+
     CREATE TABLE IF NOT EXISTS session_channels (
       session_id INTEGER NOT NULL,
       channel_id TEXT NOT NULL,

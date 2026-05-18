@@ -16,7 +16,7 @@
   TextInputStyle
 } from "discord.js";
 import { config } from "../config";
-import { GameSession, Player, PlayerTask } from "../models/session";
+import { GameSession, GameType, Player, PlayerTask } from "../models/session";
 import {
   addKill,
   addPlayer,
@@ -25,16 +25,27 @@ import {
   clearFalseReportWarnings,
   clearVotes,
   createSession,
+  getCrazyPostPendingPromptIds,
+  getCrazyPostPlayerState,
+  getCrazyPostSentences,
+  getCrazyPostTexts,
+  getActiveSessions,
   getAnyActiveSession,
   getActiveSession,
   getLatestActiveSession,
   getLatestSession,
+  getCurrentFragwuerdigRound,
   getKillCooldown,
   getKills,
   getFalseReportWarningsForGuild,
+  getFragwuerdigAnswers,
+  getFragwuerdigPlayerStates,
+  getFragwuerdigSettings,
+  getFragwuerdigVotes,
   getPlayer,
   getPlayers,
   getReports,
+  getSessionByScope,
   getSessionById,
   getTaskById,
   getTaskStepById,
@@ -606,8 +617,12 @@ export async function startMeetingVoting(guild: Guild, sessionId?: number): Prom
   await sendAdminStatus(guild, session.id);
 }
 
-export async function startEmergencyMeetingFromWeb(guild: Guild): Promise<void> {
-  const session = await requireLatestActiveSession(guild.id);
+export async function startEmergencyMeetingFromWeb(guild: Guild, sessionId: number): Promise<void> {
+  const session = await requireSession(sessionId);
+  assertSessionGuild(session, guild);
+  if (session.gameType !== "amongus") {
+    throw new Error("Emergency Meetings sind nur fuer AmongUs-Sessions verfuegbar.");
+  }
   if (session.status !== "playing") {
     throw new Error("Gerade ist kein Emergency Meeting moeglich.");
   }
@@ -638,10 +653,27 @@ export async function sendAdminStatus(guild: Guild, sessionId: number, prefix?: 
   await admin.send({ embeds: [await statusEmbed(session)] });
 }
 
-export async function getPublicWebPanelStatus(guildId: string): Promise<object> {
-  const session = await getLatestSession(guildId);
+export async function endSessionFromAdmin(guild: Guild, gameType: GameType, sessionId: number): Promise<void> {
+  const session = await getSessionByScope(guild.id, gameType, sessionId);
   if (!session) {
-    return { active: false, message: "Aktuell läuft keine Session." };
+    throw new Error("Session wurde nicht gefunden.");
+  }
+  assertSessionGuild(session, guild);
+  if (session.gameType === "amongus") {
+    await endSession(guild, session.id);
+    return;
+  }
+
+  await setSessionStatus(session.id, session.gameType === "fragwuerdig" ? "finished" : "ended");
+  const admin = await getTextChannel(guild, session.adminChannelId);
+  await admin?.send(`${gameLabel(session.gameType)}-Session ${session.id} wurde ueber das Adminpanel beendet.`).catch(() => null);
+  gameLogger.info("Session ueber Adminpanel beendet.", { guildId: guild.id, sessionId: session.id, gameType: session.gameType });
+}
+
+export async function getPublicWebPanelStatus(guildId: string, sessionId: number): Promise<object> {
+  const session = await getSessionByScope(guildId, "amongus", sessionId);
+  if (!session) {
+    return { active: false, message: "Diese AmongUs-Session wurde nicht gefunden." };
   }
 
   const votes = await getVotes(session.id);
@@ -690,26 +722,28 @@ export async function getPublicWebPanelStatus(guildId: string): Promise<object> 
   };
 }
 
-export async function getAdminPanelStatus(guildId: string): Promise<object> {
-  const session = await getLatestSession(guildId);
+export async function getAdminSessionStatus(guildId: string, gameType: GameType, sessionId: number): Promise<object> {
+  const session = await getSessionByScope(guildId, gameType, sessionId);
   if (!session) {
-    return { active: false, message: "Aktuell läuft keine Session." };
+    return { active: false, message: "Session wurde nicht gefunden." };
   }
 
   const players = await getPlayers(session.id);
-  const tasks = await getTasks(session.id);
-  const votes = await getVotes(session.id);
-  const progress = await getCrewmateTaskProgress(session.id, players, tasks);
-  const eligibleVoters = players.filter((player) => player.state === "alive");
-  const emergencyRemainingSeconds = getEmergencyCooldownRemainingSeconds(session);
   const isActive = session.status !== "ended" && session.status !== "cancelled";
-
-  return {
+  const base = {
     active: isActive,
     message: isActive ? undefined : "Session beendet.",
+    guildId: session.guildId,
+    sessionId: session.id,
+    gameType: session.gameType,
+    status: session.status,
+    debug: session.isDebugSession,
+    createdAt: session.createdAt,
+    updatedAt: session.endedAt ?? session.createdAt,
     session: {
       id: session.id,
       guildId: session.guildId,
+      gameType: session.gameType,
       status: session.status,
       meetingStatus: session.status === "meeting" ? session.meetingPhase : "none",
       meetingPhase: session.meetingPhase,
@@ -720,6 +754,37 @@ export async function getAdminPanelStatus(guildId: string): Promise<object> {
       endedAt: session.endedAt,
       isDebugSession: session.isDebugSession,
       ghostCount: session.ghostCount
+    }
+  };
+
+  if (session.gameType === "amongus") {
+    return { ...base, ...(await buildAmongUsAdminSession(session, players)) };
+  }
+  if (session.gameType === "crazy_post") {
+    return { ...base, ...(await buildCrazyPostAdminSession(session, players)) };
+  }
+  if (session.gameType === "fragwuerdig") {
+    return { ...base, ...(await buildFragwuerdigAdminSession(session, players)) };
+  }
+
+  return { ...base, ...buildFallbackAdminSession(session, players) };
+}
+
+async function buildAmongUsAdminSession(session: GameSession, players: Player[]): Promise<object> {
+  const tasks = await getTasks(session.id);
+  const votes = await getVotes(session.id);
+  const progress = await getCrewmateTaskProgress(session.id, players, tasks);
+  const eligibleVoters = players.filter((player) => player.state === "alive");
+  const emergencyRemainingSeconds = getEmergencyCooldownRemainingSeconds(session);
+  return {
+    summary: {
+      phase: session.meetingPhase === "none" ? session.status : session.meetingPhase,
+      votesCurrent: votes.length,
+      votesRequired: eligibleVoters.length,
+      emergencyCooldown: emergencyRemainingSeconds,
+      aliveCount: players.filter((player) => player.state === "alive").length,
+      deadCount: players.filter((player) => player.state === "dead").length,
+      removedCount: players.filter((player) => player.state === "removed").length
     },
     players: {
       total: players.length,
@@ -733,9 +798,11 @@ export async function getAdminPanelStatus(guildId: string): Promise<object> {
         username: player.username,
         role: player.role,
         state: player.state,
-        tasks: playerProgress(tasks.filter((task) => task.userId === player.userId))
+        tasks: playerProgress(tasks.filter((task) => task.userId === player.userId)),
+        votes: votes.filter((vote) => vote.voterId === player.userId).length
       }))
     },
+    actions: ["start_discussion", "start_voting", "evaluate_voting", "end_session", "kick_player"],
     taskProgress: progress,
     emergency: {
       cooldownReady: emergencyRemainingSeconds === 0,
@@ -756,6 +823,195 @@ export async function getAdminPanelStatus(guildId: string): Promise<object> {
       discussionTimeMinutes: session.discussionTimeMinutes,
       votingTimeMinutes: session.votingTimeMinutes
     }
+  };
+}
+
+async function buildCrazyPostAdminSession(session: GameSession, players: Player[]): Promise<object> {
+  const texts = await getCrazyPostTexts(session.id);
+  const sentencesByText = new Map<number, Awaited<ReturnType<typeof getCrazyPostSentences>>>();
+  for (const text of texts) {
+    sentencesByText.set(text.id, await getCrazyPostSentences(text.id));
+  }
+
+  const list = [];
+  let totalQueuedSentences = 0;
+  let totalPendingSubmissions = 0;
+  for (const player of players) {
+    const state = await getCrazyPostPlayerState(session.id, player.userId);
+    const queuedIds = await getCrazyPostPendingPromptIds(session.id, player.userId);
+    const submittedSentences = [...sentencesByText.values()].flat().filter((sentence) => sentence.authorId === player.userId);
+    totalQueuedSentences += queuedIds.length;
+    if (state?.activeTextId) {
+      totalPendingSubmissions += 1;
+    }
+    list.push({
+      userId: player.userId,
+      isGhost: player.isGhost,
+      discordUserId: player.discordUserId,
+      username: player.username,
+      state: crazyPostPlayerStatus(player, Boolean(state?.activeTextId), queuedIds.length, texts.length > 0 && texts.every((text) => text.finished)),
+      removed: player.state === "removed",
+      activeTextId: state?.activeTextId ?? null,
+      hasOpenAnswer: Boolean(state?.activeTextId),
+      queuedSentenceCount: queuedIds.length,
+      submittedSentenceCount: submittedSentences.length,
+      lastSubmissionAt: submittedSentences.length > 0 ? submittedSentences[submittedSentences.length - 1].createdAt : null
+    });
+  }
+
+  return {
+    summary: {
+      phase: session.status,
+      totalStories: texts.length,
+      finishedStories: texts.filter((text) => text.finished).length,
+      activeStories: texts.filter((text) => !text.finished).length,
+      totalQueuedSentences,
+      totalPendingSubmissions,
+      textCollectionChannelId: null,
+      adminLogChannelId: session.adminChannelId
+    },
+    players: {
+      total: players.length,
+      active: players.filter((player) => player.state !== "removed").length,
+      removed: players.filter((player) => player.state === "removed").length,
+      list
+    },
+    actions: ["end_session", "kick_player"]
+  };
+}
+
+async function buildFragwuerdigAdminSession(session: GameSession, players: Player[]): Promise<object> {
+  const settings = await getFragwuerdigSettings(session.id);
+  const states = await getFragwuerdigPlayerStates(session.id);
+  const stateByPlayer = new Map(states.map((state) => [state.userId, state]));
+  const round = await getCurrentFragwuerdigRound(session.id);
+  const answers = round ? await getFragwuerdigAnswers(round.id) : [];
+  const votes = round ? await getFragwuerdigVotes(round.id) : [];
+  const answerByPlayer = new Set(answers.map((answer) => answer.playerId));
+  const impostorIds = new Set(round?.impostorIds ?? []);
+
+  return {
+    summary: {
+      phase: session.status,
+      answersSubmitted: answers.length,
+      playerCount: players.length,
+      waitingQueueCount: states.filter((state) => state.queueState === "waiting").length,
+      impostorCount: settings?.impostorCount ?? 0,
+      votingActive: round?.status === "voting" || session.status === "voting",
+      votesCurrent: votes.length
+    },
+    players: {
+      total: players.length,
+      active: players.filter((player) => player.state !== "removed").length,
+      removed: players.filter((player) => player.state === "removed").length,
+      list: players.map((player) => {
+        const state = stateByPlayer.get(player.userId);
+        const answered = answerByPlayer.has(player.userId);
+        return {
+          userId: player.userId,
+          isGhost: player.isGhost,
+          discordUserId: player.discordUserId,
+          username: player.username,
+          state: fragwuerdigPlayerStatus(player, state?.queueState ?? null, answered),
+          removed: player.state === "removed",
+          answered,
+          queueState: state?.queueState ?? null,
+          isImpostor: impostorIds.has(player.userId)
+        };
+      })
+    },
+    actions: ["end_session", "kick_player"]
+  };
+}
+
+function buildFallbackAdminSession(session: GameSession, players: Player[]): object {
+  return {
+    warning: "Für diesen Spieltyp gibt es noch keine spezifische Adminansicht.",
+    summary: {
+      guildId: session.guildId,
+      gameType: session.gameType,
+      status: session.status,
+      playerCount: players.length,
+      debug: session.isDebugSession,
+      channels: {
+        lobbyChannelId: session.lobbyChannelId,
+        meetingChannelId: session.meetingChannelId,
+        adminChannelId: session.adminChannelId,
+        emergencyChannelId: session.emergencyChannelId
+      }
+    },
+    players: {
+      total: players.length,
+      list: players.map((player) => ({
+        userId: player.userId,
+        username: player.username,
+        state: player.state,
+        isGhost: player.isGhost
+      }))
+    },
+    actions: ["end_session"]
+  };
+}
+
+function crazyPostPlayerStatus(player: Player, hasOpenAnswer: boolean, queuedCount: number, allFinished: boolean): string {
+  if (player.state === "removed") return "entfernt";
+  if (hasOpenAnswer) return "schreibt gerade";
+  if (queuedCount > 0) return "wartet";
+  if (allFinished) return "fertig";
+  return "aktiv";
+}
+
+function fragwuerdigPlayerStatus(player: Player, queueState: string | null, answered: boolean): string {
+  if (player.state === "removed") return "entfernt";
+  if (queueState === "waiting") return "in Warteschlange";
+  if (answered) return "hat geantwortet";
+  if (queueState === "active") return "aktiv";
+  if (queueState === "left") return "entfernt";
+  return "wartet";
+}
+
+export async function getAdminPanelOverview(
+  guildIds: string[],
+  guildNameResolver: (guildId: string) => Promise<string | null>
+): Promise<object> {
+  const sessions = await getActiveSessions(guildIds);
+  const guildNames = new Map<string, string | null>();
+  const visibleGuildIds = [...new Set([...guildIds, ...sessions.map((session) => session.guildId)])];
+  for (const guildId of visibleGuildIds) {
+    guildNames.set(guildId, await guildNameResolver(guildId));
+  }
+
+  const rows = [];
+  for (const session of sessions) {
+    const players = await getPlayers(session.id);
+    const detail = await getAdminSessionStatus(session.guildId, session.gameType, session.id) as { summary?: object };
+    rows.push({
+      guildId: session.guildId,
+      guildName: guildNames.get(session.guildId) ?? null,
+      gameType: session.gameType,
+      sessionId: session.id,
+      status: session.status,
+      meetingPhase: session.meetingPhase,
+      playerCount: players.length,
+      activePlayers: players.filter((player) => player.state !== "removed").length,
+      ghostCount: players.filter((player) => player.isGhost).length,
+      isDebugSession: session.isDebugSession,
+      createdAt: session.createdAt,
+      runtimeSeconds: Math.max(0, Math.floor((Date.now() - new Date(session.createdAt).getTime()) / 1000)),
+      channels: {
+        lobbyChannelId: session.lobbyChannelId,
+        meetingChannelId: session.meetingChannelId,
+        adminChannelId: session.adminChannelId,
+        emergencyChannelId: session.emergencyChannelId
+      },
+      summary: detail.summary ?? null
+    });
+  }
+
+  return {
+    ok: true,
+    guilds: visibleGuildIds.map((guildId) => ({ guildId, guildName: guildNames.get(guildId) ?? null })),
+    sessions: rows
   };
 }
 
@@ -934,8 +1190,9 @@ export async function debugVote(guild: Guild, sessionId: number, voterIdentifier
   return `Vote gespeichert (${votes.length}/${players.filter((player) => player.state === "alive").length}).`;
 }
 
-export async function kickPlayerFromAdmin(guild: Guild, playerId: string): Promise<string> {
-  const session = await requireLatestActiveSession(guild.id);
+export async function kickPlayerFromAdmin(guild: Guild, sessionId: number, playerId: string): Promise<string> {
+  const session = await requireSession(sessionId);
+  assertSessionGuild(session, guild);
   const player = await getPlayer(session.id, playerId);
   if (!player) {
     throw new Error("Spieler ist nicht Teil der aktiven Session.");
@@ -954,8 +1211,13 @@ export async function kickPlayerFromAdmin(guild: Guild, playerId: string): Promi
   }
 
   const message = `${playerLabel(player)}${player.isGhost ? " (Ghost)" : ""} wurde ueber das Adminpanel aus der Session entfernt.`;
-  await sendAdminStatus(guild, session.id, message);
-  await finishIfWinConditionReached(guild, session.id);
+  if (session.gameType === "amongus") {
+    await sendAdminStatus(guild, session.id, message);
+    await finishIfWinConditionReached(guild, session.id);
+  } else {
+    const admin = await getTextChannel(guild, session.adminChannelId);
+    await admin?.send(message).catch(() => null);
+  }
   gameLogger.info("Spieler ueber Adminpanel entfernt.", { sessionId: session.id, playerId: player.userId, isGhost: player.isGhost });
   return message;
 }
@@ -1227,6 +1489,16 @@ function labelForPlayerId(players: Player[], playerId: string | null): string {
     return playerId;
   }
   return `${playerLabel(player)}${player.isGhost ? " (Ghost)" : ""}`;
+}
+
+function gameLabel(gameType: GameType): string {
+  if (gameType === "amongus") {
+    return "AmongUs";
+  }
+  if (gameType === "crazy_post") {
+    return "Verrueckte Post";
+  }
+  return "Fragwuerdig";
 }
 
 async function statusEmbed(session: GameSession, revealRoles = true): Promise<EmbedBuilder> {

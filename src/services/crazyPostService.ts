@@ -21,6 +21,7 @@ import {
   claimCrazyPostActiveText,
   clearCrazyPostActiveTextIfMatches,
   clearCrazyPostPendingPrompts,
+  createCrazyPostReviewEntry,
   createCrazyPostSession,
   dequeueCrazyPostPendingPrompt,
   ensureCrazyPostPlayerState,
@@ -29,14 +30,19 @@ import {
   getActiveCrazyPostSessionByChannel,
   getCrazyPostPlayerState,
   getCrazyPostPendingPromptIds,
+  getCrazyPostReviewById,
   getCrazyPostSentences,
   getCrazyPostTextById,
   getCrazyPostTexts,
+  getCrazyPostReviews,
   getNextCrazyPostTextForPlayer,
   getPlayer,
   getPlayers,
   getSessionById,
   getTemporarySessionChannelIds,
+  markCrazyPostReviewPosted,
+  markCrazyPostReviewRejected,
+  updateCrazyPostReviewEditedText,
   setCrazyPostActiveMessageId,
   setCrazyPostPlayerState,
   setCrazyPostQueueMessageId,
@@ -45,8 +51,9 @@ import {
   setSessionStatus,
   updateSessionChannels
 } from "../db/repository";
-import { CrazyPostOrderMode, GameSession, Player } from "../models/session";
+import { CrazyPostOrderMode, CrazyPostReview, GameSession, Player } from "../models/session";
 import { ids } from "../utils/customIds";
+import { PLAIN_GAME_MESSAGE_ERROR, validatePlainGameMessage, validatePlainGameText } from "../utils/gameMessageValidation";
 import { messageGuildId } from "../utils/guildContext";
 import { logger } from "../utils/logger";
 
@@ -194,6 +201,13 @@ export async function handleCrazyPostPlayerMessage(message: Message): Promise<bo
     return true;
   }
 
+  const validation = validatePlainGameMessage(message);
+  if (!validation.ok) {
+    crazyPostLogger.warn("Spielnachricht blockiert.", { guildId, sessionId: session.id, userId: message.author.id, reason: validation.reason });
+    await message.reply(PLAIN_GAME_MESSAGE_ERROR).catch(() => null);
+    return true;
+  }
+
   const content = normalizeSentence(message.content);
   if (!content) {
     await message.reply("Bitte schreibe genau einen Satz als normale Textnachricht.").catch(() => null);
@@ -235,6 +249,8 @@ async function submitCrazyPostAnswer(guild: Guild, session: GameSession, player:
 
     if (!finished) {
       await queueOrSendCrazyPostTask(guild, session.id, text.route[nextStepIndex], text.id);
+    } else {
+      await createCrazyPostReviewForText(session, text.id);
     }
 
     await releaseNextCrazyPostTaskUnlocked(guild, session.id, player.userId);
@@ -429,7 +445,6 @@ async function finishCrazyPostIfComplete(guild: Guild, sessionId: number): Promi
   for (const text of texts) {
     await sendFinishedTextToOrigin(guild, sessionId, text.id);
   }
-  await sendFinishedTextsToCollection(guild, sessionId, texts.map((text) => text.id));
   await logCrazyPostFinalTexts(guild, sessionId, texts.map((text) => text.id));
   const signup = await getTextChannel(guild, session.lobbyChannelId);
   const admin = await getTextChannel(guild, session.adminChannelId);
@@ -437,7 +452,29 @@ async function finishCrazyPostIfComplete(guild: Guild, sessionId: number): Promi
     new ButtonBuilder().setCustomId(ids.crazyPostDelete(session.guildId, session.id)).setLabel("Session aufraeumen").setStyle(ButtonStyle.Danger)
   );
   await signup?.send("Verrueckte Post ist fertig. Alle Spieler haben ihren vollstaendigen Text erhalten.").catch(() => null);
-  await admin?.send({ content: "Verrueckte-Post-Session beendet.", components: [row] }).catch(() => null);
+  await admin?.send({ content: "Verrueckte-Post-Session beendet. Fertige Texte warten im Adminpanel auf Review.", components: [row] }).catch(() => null);
+}
+
+async function createCrazyPostReviewForText(session: GameSession, textId: number): Promise<CrazyPostReview> {
+  const sentences = await getCrazyPostSentences(textId);
+  const hasGhostPlayers = (await getPlayers(session.id)).some((player) => player.isGhost);
+  const review = await createCrazyPostReviewEntry({
+    reviewId: `cp-${session.guildId}-${session.id}-${textId}`,
+    guildId: session.guildId,
+    sessionId: session.id,
+    textId,
+    originalText: formatFinishedText(sentences),
+    contributions: sentences.map((sentence) => ({ authorId: sentence.authorId, content: sentence.content, createdAt: sentence.createdAt })),
+    debugSession: session.isDebugSession || hasGhostPlayers
+  });
+  crazyPostLogger.info("Verrueckte-Post-Text fuer Review vorgemerkt.", {
+    guildId: session.guildId,
+    sessionId: session.id,
+    reviewId: review.reviewId,
+    textId,
+    debugSession: review.debugSession
+  });
+  return review;
 }
 
 async function sendFinishedTextToOrigin(guild: Guild, sessionId: number, textId: number): Promise<void> {
@@ -519,34 +556,122 @@ async function logCrazyPostSubmission(
   ].join("\n"));
 }
 
-async function sendFinishedTextsToCollection(guild: Guild, sessionId: number, textIds: number[]): Promise<void> {
-  const session = await requireCrazyPostSession(sessionId);
-  const hasGhostPlayers = (await getPlayers(sessionId)).some((player) => player.isGhost);
-  if (session.isDebugSession || hasGhostPlayers) {
-    crazyPostLogger.info("Textsammlung skipped because session is debug/ghost session.", {
-      sessionId,
-      isDebugSession: session.isDebugSession,
-      hasGhostPlayers
-    });
-    const admin = await getTextChannel(guild, session.adminChannelId);
-    await admin?.send("Debug/Ghost-Runde: text-sammlung wurde bewusst uebersprungen.").catch(() => null);
-    return;
-  }
+export async function getCrazyPostPendingReviewSummary(guildIds: string[]): Promise<{ count: number; reviewIds: string[] }> {
+  const reviews = await getCrazyPostReviews("pending_review", guildIds);
+  return { count: reviews.length, reviewIds: reviews.map((review) => review.reviewId) };
+}
 
+export async function listCrazyPostReviewsForAdmin(
+  guildIds: string[],
+  status: "pending_review" | "approved" | "rejected" | "posted" | "all" = "pending_review"
+): Promise<object> {
+  const reviews = await getCrazyPostReviews(status === "all" ? undefined : status, guildIds);
+  return { ok: true, reviews: reviews.map(reviewListItem) };
+}
+
+export async function getCrazyPostReviewDetailForAdmin(reviewId: string): Promise<object> {
+  const review = await requireCrazyPostReview(reviewId);
+  return { ok: true, review };
+}
+
+export async function saveCrazyPostReviewEdit(reviewId: string, editedText: string | null): Promise<object> {
+  const review = await requireCrazyPostReview(reviewId);
+  if (review.status === "posted" || review.status === "rejected") {
+    throw new Error("Dieser Review-Eintrag kann nicht mehr bearbeitet werden.");
+  }
+  await updateCrazyPostReviewEditedText(reviewId, editedText && editedText.trim() ? editedText.trim() : null);
+  return { ok: true, message: "Review-Text gespeichert." };
+}
+
+export async function rejectCrazyPostReviewFromAdmin(reviewId: string): Promise<object> {
+  const review = await requireCrazyPostReview(reviewId);
+  if (review.status !== "pending_review") {
+    return { ok: true, message: `Review ${reviewId} ist nicht mehr pending.` };
+  }
+  await markCrazyPostReviewRejected(reviewId);
+  crazyPostLogger.info("Verrueckte-Post-Review abgelehnt.", { guildId: review.guildId, sessionId: review.sessionId, reviewId });
+  return { ok: true, message: `Review ${reviewId} wurde abgelehnt.` };
+}
+
+export async function bulkRejectCrazyPostReviewsFromAdmin(reviewIds: string[], guildIds: string[] = []): Promise<object> {
+  const uniqueIds = [...new Set(reviewIds.filter(Boolean))];
+  const allowed = new Set(guildIds);
+  for (const reviewId of uniqueIds) {
+    const review = await getCrazyPostReviewById(reviewId);
+    if (review && allowed.size > 0 && !allowed.has(review.guildId)) {
+      continue;
+    }
+    if (review?.status === "pending_review") {
+      await markCrazyPostReviewRejected(reviewId);
+      crazyPostLogger.info("Verrueckte-Post-Review per Bulk-Aktion abgelehnt.", { guildId: review.guildId, sessionId: review.sessionId, reviewId });
+    }
+  }
+  return { ok: true, message: `${uniqueIds.length} Review-Eintraege wurden verarbeitet.` };
+}
+
+export async function approveAndPostCrazyPostReview(guild: Guild, reviewId: string): Promise<object> {
+  const review = await requireCrazyPostReview(reviewId);
+  if (review.guildId !== guild.id) {
+    throw new Error("Dieser Review gehoert zu einer anderen Guild.");
+  }
+  if (review.status !== "pending_review" && review.status !== "approved") {
+    throw new Error("Dieser Review kann nicht mehr gepostet werden.");
+  }
+  if (review.debugSession) {
+    throw new Error("Debug-/Ghost-Texte duerfen nicht in die Textsammlung gepostet werden.");
+  }
+  const content = (review.editedText ?? review.originalText).trim();
+  if (!content) {
+    throw new Error("Der Review-Text ist leer.");
+  }
+  if (!validatePlainGameText(content).ok) {
+    throw new Error(PLAIN_GAME_MESSAGE_ERROR);
+  }
   const channel = await findTextChannelByName(guild, TEXT_COLLECTION_CHANNEL_NAME);
   if (!channel) {
-    const admin = await getTextChannel(guild, session.adminChannelId);
-    await admin?.send(`Channel #${TEXT_COLLECTION_CHANNEL_NAME} wurde nicht gefunden. Fertige Texte konnten dort nicht gesammelt werden.`).catch(() => null);
-    return;
+    throw new Error(`Channel #${TEXT_COLLECTION_CHANNEL_NAME} wurde auf dieser Guild nicht gefunden.`);
   }
-  const lines = [`## Verrueckte Post - Runde ${sessionId}`, ""];
-  for (let index = 0; index < textIds.length; index += 1) {
-    const sentences = await getCrazyPostSentences(textIds[index]);
-    lines.push(`### Text ${index + 1}`);
-    lines.push(formatFinishedText(sentences));
-    lines.push("");
+
+  try {
+    const message = await sendLongText(channel, [`## Verrueckte Post - Session ${review.sessionId}`, "", content].join("\n"));
+    if (!message) {
+      throw new Error("Der Text konnte nicht gepostet werden.");
+    }
+    await markCrazyPostReviewPosted(reviewId, message.id);
+    crazyPostLogger.info("Verrueckte-Post-Review gepostet.", { guildId: guild.id, sessionId: review.sessionId, reviewId, messageId: message.id });
+    return { ok: true, message: "Text wurde approved und in die Textsammlung gepostet." };
+  } catch (error) {
+    crazyPostLogger.error("Verrueckte-Post-Review konnte nicht gepostet werden.", {
+      guildId: guild.id,
+      sessionId: review.sessionId,
+      reviewId,
+      error
+    });
+    throw error;
   }
-  await sendLongText(channel, lines.join("\n").trimEnd());
+}
+
+function reviewListItem(review: CrazyPostReview): object {
+  const text = review.editedText ?? review.originalText;
+  return {
+    reviewId: review.reviewId,
+    guildId: review.guildId,
+    sessionId: review.sessionId,
+    textId: review.textId,
+    createdAt: review.createdAt,
+    updatedAt: review.updatedAt,
+    status: review.status,
+    preview: text.length > 180 ? `${text.slice(0, 177)}...` : text,
+    debugSession: review.debugSession
+  };
+}
+
+async function requireCrazyPostReview(reviewId: string): Promise<CrazyPostReview> {
+  const review = await getCrazyPostReviewById(reviewId);
+  if (!review) {
+    throw new Error("Review-Eintrag wurde nicht gefunden.");
+  }
+  return review;
 }
 
 async function logCrazyPostFinalTexts(guild: Guild, sessionId: number, textIds: number[]): Promise<void> {
@@ -945,9 +1070,10 @@ function formatPlayerIdForAdmin(players: Player[], userId: string): string {
   return player ? formatPlayerForAdmin(player) : `<@${userId}> (${userId})`;
 }
 
-async function sendLongText(channel: TextChannel, content: string): Promise<void> {
+async function sendLongText(channel: TextChannel, content: string): Promise<Message | null> {
   const maxLength = 1900;
   let remaining = content;
+  let lastMessage: Message | null = null;
   while (remaining.length > maxLength) {
     let splitAt = remaining.lastIndexOf("\n", maxLength);
     if (splitAt < 1) {
@@ -955,13 +1081,14 @@ async function sendLongText(channel: TextChannel, content: string): Promise<void
     }
     const chunk = remaining.slice(0, splitAt).trimEnd();
     if (chunk) {
-      await channel.send(chunk);
+      lastMessage = await channel.send(chunk);
     }
     remaining = remaining.slice(splitAt).trimStart();
   }
   if (remaining.length > 0) {
-    await channel.send(remaining);
+    lastMessage = await channel.send(remaining);
   }
+  return lastMessage;
 }
 
 async function findTextChannelByName(guild: Guild, name: string): Promise<TextChannel | null> {

@@ -2,6 +2,8 @@ import {
   CatalogTask,
   CrazyPostOrderMode,
   CrazyPostPlayerState,
+  CrazyPostReview,
+  CrazyPostReviewStatus,
   CrazyPostSentence,
   CrazyPostText,
   FragwuerdigAnswer,
@@ -11,6 +13,7 @@ import {
   FragwuerdigRound,
   FragwuerdigSettings,
   FragwuerdigVote,
+  GameType,
   GameSession,
   MeetingPhase,
   Player,
@@ -252,6 +255,33 @@ export async function getSessionById(sessionId: number): Promise<GameSession | n
   return row ? mapSession(row) : null;
 }
 
+function mapCrazyPostReview(row: any): CrazyPostReview {
+  return {
+    reviewId: row.review_id,
+    guildId: row.guild_id,
+    sessionId: row.session_id,
+    textId: row.text_id,
+    gameType: "crazy_post",
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+    status: row.status,
+    originalText: row.original_text,
+    editedText: row.edited_text,
+    contributions: JSON.parse(row.contributions_json),
+    debugSession: row.debug_session === 1,
+    rejectedAt: row.rejected_at,
+    approvedAt: row.approved_at,
+    postedAt: row.posted_at,
+    textCollectionMessageId: row.text_collection_message_id
+  };
+}
+
+export async function getSessionByScope(guildId: string, gameType: GameType, sessionId: number): Promise<GameSession | null> {
+  const db = await getDb();
+  const row = await db.get("SELECT * FROM sessions WHERE guild_id = ? AND game_type = ? AND id = ?", guildId, gameType, sessionId);
+  return row ? mapSession(row) : null;
+}
+
 export async function getActiveSession(guildId: string): Promise<GameSession | null> {
   const db = await getDb();
   const row = await db.get(
@@ -282,6 +312,18 @@ export async function getLatestActiveSession(guildId?: string): Promise<GameSess
 
 export async function getAnyActiveSession(guildId: string): Promise<GameSession | null> {
   return getLatestActiveSession(guildId);
+}
+
+export async function getActiveSessions(guildIds?: string[]): Promise<GameSession[]> {
+  const db = await getDb();
+  const activeFilter = "status NOT IN ('ended', 'cancelled', 'finished')";
+  const rows = guildIds && guildIds.length > 0
+    ? await db.all(
+      `SELECT * FROM sessions WHERE ${activeFilter} AND guild_id IN (${guildIds.map(() => "?").join(",")}) ORDER BY guild_id ASC, id DESC`,
+      ...guildIds
+    )
+    : await db.all(`SELECT * FROM sessions WHERE ${activeFilter} ORDER BY guild_id ASC, id DESC`);
+  return rows.map(mapSession);
 }
 
 export async function getActiveFragwuerdigSessionByChannel(guildId: string, channelId: string): Promise<GameSession | null> {
@@ -864,6 +906,89 @@ export async function setCrazyPostQueueWarningActive(sessionId: number, userId: 
     active ? 1 : 0,
     sessionId,
     userId
+  );
+}
+
+export async function createCrazyPostReviewEntry(values: {
+  reviewId: string;
+  guildId: string;
+  sessionId: number;
+  textId: number;
+  originalText: string;
+  contributions: CrazyPostReview["contributions"];
+  debugSession: boolean;
+}): Promise<CrazyPostReview> {
+  const db = await getDb();
+  await db.run(
+    `INSERT OR IGNORE INTO crazy_post_reviews
+       (review_id, guild_id, session_id, text_id, original_text, contributions_json, debug_session)
+     VALUES (?, ?, ?, ?, ?, ?, ?)`,
+    values.reviewId,
+    values.guildId,
+    values.sessionId,
+    values.textId,
+    values.originalText,
+    JSON.stringify(values.contributions),
+    values.debugSession ? 1 : 0
+  );
+  return getCrazyPostReviewByTextId(values.sessionId, values.textId) as Promise<CrazyPostReview>;
+}
+
+export async function getCrazyPostReviewByTextId(sessionId: number, textId: number): Promise<CrazyPostReview | null> {
+  const db = await getDb();
+  const row = await db.get("SELECT * FROM crazy_post_reviews WHERE session_id = ? AND text_id = ?", sessionId, textId);
+  return row ? mapCrazyPostReview(row) : null;
+}
+
+export async function getCrazyPostReviewById(reviewId: string): Promise<CrazyPostReview | null> {
+  const db = await getDb();
+  const row = await db.get("SELECT * FROM crazy_post_reviews WHERE review_id = ?", reviewId);
+  return row ? mapCrazyPostReview(row) : null;
+}
+
+export async function getCrazyPostReviews(status?: CrazyPostReviewStatus, guildIds?: string[]): Promise<CrazyPostReview[]> {
+  const db = await getDb();
+  const filters = [];
+  const params: unknown[] = [];
+  if (status) {
+    filters.push("status = ?");
+    params.push(status);
+  }
+  if (guildIds && guildIds.length > 0) {
+    filters.push(`guild_id IN (${guildIds.map(() => "?").join(",")})`);
+    params.push(...guildIds);
+  }
+  const where = filters.length ? `WHERE ${filters.join(" AND ")}` : "";
+  const rows = await db.all(`SELECT * FROM crazy_post_reviews ${where} ORDER BY created_at ASC, review_id ASC`, ...params);
+  return rows.map(mapCrazyPostReview);
+}
+
+export async function updateCrazyPostReviewEditedText(reviewId: string, editedText: string | null): Promise<void> {
+  const db = await getDb();
+  await db.run(
+    "UPDATE crazy_post_reviews SET edited_text = ?, updated_at = CURRENT_TIMESTAMP WHERE review_id = ?",
+    editedText,
+    reviewId
+  );
+}
+
+export async function markCrazyPostReviewRejected(reviewId: string): Promise<void> {
+  const db = await getDb();
+  await db.run(
+    "UPDATE crazy_post_reviews SET status = 'rejected', rejected_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP WHERE review_id = ? AND status = 'pending_review'",
+    reviewId
+  );
+}
+
+export async function markCrazyPostReviewPosted(reviewId: string, messageId: string): Promise<void> {
+  const db = await getDb();
+  await db.run(
+    `UPDATE crazy_post_reviews
+     SET status = 'posted', approved_at = COALESCE(approved_at, CURRENT_TIMESTAMP), posted_at = CURRENT_TIMESTAMP,
+         text_collection_message_id = ?, updated_at = CURRENT_TIMESTAMP
+     WHERE review_id = ? AND status IN ('pending_review', 'approved')`,
+    messageId,
+    reviewId
   );
 }
 

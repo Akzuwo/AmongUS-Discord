@@ -127,6 +127,27 @@ export interface CrazyPostSentence {
   createdAt: string;
 }
 
+export type CrazyPostReviewStatus = "pending_review" | "approved" | "rejected" | "posted";
+
+export interface CrazyPostReview {
+  reviewId: string;
+  guildId: string;
+  sessionId: number;
+  textId: number;
+  gameType: "crazy_post";
+  createdAt: string;
+  updatedAt: string;
+  status: CrazyPostReviewStatus;
+  originalText: string;
+  editedText: string | null;
+  contributions: Array<{ authorId: string; content: string; createdAt: string }>;
+  debugSession: boolean;
+  rejectedAt: string | null;
+  approvedAt: string | null;
+  postedAt: string | null;
+  textCollectionMessageId: string | null;
+}
+
 export interface CrazyPostPlayerState {
   sessionId: number;
   userId: string;

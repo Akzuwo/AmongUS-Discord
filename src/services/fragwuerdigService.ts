@@ -47,7 +47,11 @@ import {
 } from "../db/repository";
 import { FragwuerdigAnswerType, FragwuerdigQuestionPair, FragwuerdigRound, GameSession, Player } from "../models/session";
 import { ids } from "../utils/customIds";
+import { PLAIN_GAME_MESSAGE_ERROR, validatePlainGameMessage } from "../utils/gameMessageValidation";
 import { messageGuildId } from "../utils/guildContext";
+import { logger } from "../utils/logger";
+
+const fragwuerdigLogger = logger.scoped("Fragwuerdig");
 
 export async function createFragwuerdigGameSession(guild: Guild, creator: GuildMember, impostorCount: 1 | 2): Promise<GameSession> {
   const active = await getAnyActiveSession(guild.id);
@@ -178,6 +182,13 @@ export async function handleFragwuerdigPlayerMessage(message: Message): Promise<
   const existingAnswers = await getFragwuerdigAnswers(round.id);
   if (existingAnswers.some((answer) => answer.playerId === player.userId)) {
     await message.reply("Deine Antwort wurde bereits gespeichert.").catch(() => null);
+    return true;
+  }
+
+  const validation = validatePlainGameMessage(message);
+  if (!validation.ok) {
+    fragwuerdigLogger.warn("Spielnachricht blockiert.", { guildId, sessionId: session.id, userId: message.author.id, reason: validation.reason });
+    await message.reply(PLAIN_GAME_MESSAGE_ERROR).catch(() => null);
     return true;
   }
 
